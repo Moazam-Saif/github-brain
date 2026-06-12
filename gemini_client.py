@@ -47,8 +47,9 @@ from google.genai import types
 from google.oauth2 import service_account
 
 # Model names used across the project.
+# GEMINI_MODEL reads from env so you can override via GEMINI_MODEL= in .env
 GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-EMBEDDING_MODEL = "models/text-embedding-004"
+EMBEDDING_MODEL = "text-embedding-004"   # Vertex AI path (no "models/" prefix)
 
 
 def get_client() -> genai.Client:

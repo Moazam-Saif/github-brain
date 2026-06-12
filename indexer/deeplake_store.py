@@ -161,7 +161,13 @@ def delete_repo_chunks(repo_name: str) -> int:
     indices = []
     for i in range(total):
         try:
-            meta = json.loads(str(ds.metadata[i].numpy()))
+            raw = ds.metadata[i].numpy()
+            # Deep Lake can return bytes, str, or ndarray — normalise to str
+            if hasattr(raw, 'item'):
+                raw = raw.item()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            meta = json.loads(str(raw))
             if meta.get("repo_name") == repo_name:
                 indices.append(i)
         except Exception:
@@ -211,7 +217,12 @@ def _load_all(repo_name: Optional[str] = None) -> tuple[np.ndarray, list[str], l
         all_metas      = []
         for i in range(total):
             try:
-                all_metas.append(json.loads(str(ds.metadata[i].numpy())))
+                raw = ds.metadata[i].numpy()
+                if hasattr(raw, 'item'):
+                    raw = raw.item()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                all_metas.append(json.loads(str(raw)))
             except Exception:
                 all_metas.append({})
     except Exception as e:
