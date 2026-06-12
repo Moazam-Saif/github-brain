@@ -47,7 +47,7 @@ from google.genai import types
 from google.oauth2 import service_account
 
 # Model names used across the project.
-GEMINI_MODEL   = "gemini-1.5-flash"
+GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 EMBEDDING_MODEL = "models/text-embedding-004"
 
 
