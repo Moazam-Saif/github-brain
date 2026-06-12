@@ -121,14 +121,24 @@ Rules for the new boolean and categorical fields:
 - has_tests: true if any test files, test commands, or testing frameworks are mentioned
 
 Rules for files_to_index:
-- Set "found" to true ONLY if the README contains an explicit list of files/folders
-  described as important or worth reading. Look for sections like "Project Structure",
-  "Only the files that matter", code blocks listing source files with descriptions.
-- If "found" is true, "paths" must contain every explicitly listed important path.
-  Do NOT include paths listed under "not worth looking at" or similar exclusion language.
-- "extensions" must list every file extension present among the listed paths.
+- Set "found" to true ONLY when the README has a dedicated section whose heading or
+  title signals that the author intentionally curated a list of important files.
+  Trigger phrases include: "Essential Files", "Key Files", "Read these files",
+  "Only the files that matter", "Start here", "Important files", or any heading
+  that names a specific short list of files worth reading.
+- A generic "Project Structure" section or directory tree that lists ALL files
+  in the repo is NOT a valid trigger — set "found" to false for those.
+- PRIORITY RULE: If the README contains BOTH a full project structure tree AND
+  a separately named curated section (e.g. a "Read these files" table), use ONLY
+  the curated section. Ignore the full project tree entirely.
+- If "found" is true:
+    • "paths" must contain every file path from the curated section.
+    • If there is an explicit exclusion block ("Not worth looking at", "Ignore these",
+      "Skip these", etc.), do NOT include any paths from that block.
+    • Do NOT add paths from any full project structure tree.
+    • "extensions" must list every file extension present among the included paths.
 - If "found" is false, set "paths" to [] and "extensions" to [].
-- Only include paths EXPLICITLY mentioned. Never infer or guess."""
+- Only include paths EXPLICITLY named. Never infer or guess."""
 
 
 SOURCE_LABELS = {
