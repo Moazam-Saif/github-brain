@@ -23,34 +23,18 @@ Why task_type matters:
   improves retrieval accuracy.
 """
 
-import os
 import time
-from google import genai
 from typing import Optional
+from gemini_client import get_client, EMBEDDING_MODEL
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-EMBEDDING_MODEL   = "models/text-embedding-004"
-EMBEDDING_DIM     = 768        # output dimension for text-embedding-004
-
-# Free tier: 100 requests/min → 1 request per 0.6s to stay safely under limit.
-# We use 0.65s to add a small safety buffer.
-REQUEST_INTERVAL_SECONDS = 0.65
-
-# Batch size: how many chunks to embed before printing a progress update.
-PROGRESS_BATCH_SIZE = 20
-
-
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
-
-def _configure_genai():
-    """Return a configured Gemini client."""
-    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+EMBEDDING_DIM            = 768   # output dimension for text-embedding-004
+REQUEST_INTERVAL_SECONDS = 0.65  # stay under 100 req/min free tier
+PROGRESS_BATCH_SIZE      = 20
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +45,7 @@ def _embed_single(
     text: str,
     task_type: str = "RETRIEVAL_DOCUMENT",
     max_retries: int = 3,
-) -> Optional[list[float]]:
+) -> list[float] | None:
     """
     Embed a single text string and return its vector.
 
@@ -71,7 +55,7 @@ def _embed_single(
       "RETRIEVAL_DOCUMENT" → used when indexing (storing chunks)
       "RETRIEVAL_QUERY"    → used when searching (embedding user questions)
     """
-    client = _configure_genai()
+    client = get_client()
 
     for attempt in range(max_retries):
         try:

@@ -27,16 +27,7 @@ import os
 import json
 import time
 from typing import Optional
-from google import genai
-
-
-# ---------------------------------------------------------------------------
-# Gemini setup
-# ---------------------------------------------------------------------------
-
-def _get_gemini_client():
-    """Return a configured Gemini client."""
-    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+from gemini_client import get_client, GEMINI_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +166,7 @@ def _extract_with_gemini(
     for attempt in range(max_retries):
         try:
             response = model.models.generate_content(
-                model="gemini-1.5-flash", contents=prompt
+                model=GEMINI_MODEL, contents=prompt
             )
             raw = response.text.strip()
 
@@ -310,7 +301,7 @@ def generate_repo_metadata(
         confidence = "high" if source_type == "readme" else "medium"
         print(f"  [metadata] Extracting from {source_type} (confidence: {confidence})")
 
-        model = _get_gemini_client()
+        model = get_client()
         time.sleep(4)  # Stay under 15 req/min free tier.
 
         gemini = _extract_with_gemini(source_type, source_content, model)

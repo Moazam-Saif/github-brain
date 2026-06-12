@@ -45,11 +45,10 @@ RATE LIMITING:
   15 requests/minute on the free tier.
 """
 
-import os
 import json
 import time
 from typing import Optional
-from google import genai
+from gemini_client import get_client, GEMINI_MODEL
 
 from query.router    import classify_question
 from query.retriever import (retrieve_cross_repo_metadata,
@@ -107,7 +106,7 @@ def _manage_context_window(session: dict, client) -> dict:
 
     try:
         response = client.models.generate_content(
-            model="gemini-1.5-flash", contents=summary_prompt
+            model=GEMINI_MODEL, contents=summary_prompt
         )
         summary = response.text.strip()
         time.sleep(4)
@@ -122,16 +121,6 @@ def _manage_context_window(session: dict, client) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Gemini client
-# ---------------------------------------------------------------------------
-
-def _get_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is required but was not provided.")
-    return genai.Client(api_key=api_key)
-
-
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
@@ -353,7 +342,7 @@ def _generate_answer(prompt: str, client, max_retries: int = 3) -> str:
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model="gemini-1.5-flash", contents=prompt
+                model=GEMINI_MODEL, contents=prompt
             )
             time.sleep(4)
             return response.text.strip()
@@ -403,7 +392,7 @@ def query(
         Gemini → generate answer
         session update → append turn to history (repo_specific only)
     """
-    client      = _get_client()
+    client      = get_client()
     active_repo = session["active_repo"] if session else None
 
     print(f"\n[engine] Question: '{question}'")

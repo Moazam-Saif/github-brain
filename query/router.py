@@ -54,11 +54,10 @@ FALLBACK:
   it might just be slightly slower than a metadata lookup would have been.
 """
 
-import os
 import json
 import time
 from typing import Optional
-from google import genai
+from gemini_client import get_client, GEMINI_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -139,17 +138,6 @@ Return exactly one of:
 
 
 # ---------------------------------------------------------------------------
-# Gemini client
-# ---------------------------------------------------------------------------
-
-def _get_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is required but was not provided.")
-    return genai.Client(api_key=api_key)
-
-
-# ---------------------------------------------------------------------------
 # Public function
 # ---------------------------------------------------------------------------
 
@@ -174,7 +162,7 @@ def classify_question(
 
     Falls back to {"type": "cross_repo_semantic"} on failure.
     """
-    client = _get_client()
+    client = get_client()
     prompt = ROUTER_PROMPT.format(
         question=question,
         active_repo=active_repo if active_repo else "none",
@@ -187,7 +175,7 @@ def classify_question(
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model="gemini-1.5-flash", contents=prompt
+                model=GEMINI_MODEL, contents=prompt
             )
             raw = response.text.strip()
 
