@@ -1,0 +1,37 @@
+# Environment variables — never commit API keys
+.env
+.env.local
+.env.production
+
+# Python virtual environment
+venv/
+env/
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test and dev scripts
+test_setup.py
+
+# Deep Lake local datasets (if you ever switch to local storage)
+*_db/
+*_dataset/
+*.deeplake/
+
+# OS files
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
