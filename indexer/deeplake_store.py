@@ -48,7 +48,7 @@ def _get_dataset_path() -> str:
     org = os.getenv("ACTIVELOOP_ORG")
     if not org:
         raise ValueError("ACTIVELOOP_ORG is required but was not provided.")
-    return f"hub://{org}/github_brain_v4"
+    return f"hub://{org}/github_brain_v5"
 
 
 def _get_token() -> str:
@@ -72,8 +72,8 @@ def get_or_create_dataset() -> deeplake.Dataset:
         print(f"[deeplake] Creating tensors in dataset: {path}")
         ds.create_tensor("embedding", htype="embedding",
                          dtype="float32", sample_compression=None)
-        ds.create_tensor("text",      htype="text", dtype=str)
-        ds.create_tensor("metadata",  htype="json", dtype=str)
+        ds.create_tensor("text",      htype="text")
+        ds.create_tensor("metadata",  htype="json")
         print(f"[deeplake] Dataset ready.")
     else:
         print(f"[deeplake] Opened existing dataset: {path}")
