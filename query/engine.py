@@ -461,13 +461,18 @@ def query(
     # -----------------------------------------------------------------------
     repo_name = route["repo"]
 
+# Normalize repo name casing against what's actually indexed.
+    all_repos = list_all_repos()
+    matched_repo = next(
+        (r for r in all_repos if r["repo_name"].lower() == repo_name.lower()),
+        None,
+    )
+    if matched_repo:
+        repo_name = matched_repo["repo_name"]  # use the exact casing from the dataset
+
     # Start new session or continue existing one.
     if session is None or session.get("active_repo") != repo_name:
-        all_repos  = list_all_repos()
-        repo_meta  = next(
-            (r for r in all_repos if r["repo_name"] == repo_name),
-            {"repo_name": repo_name},
-        )
+        repo_meta = matched_repo or {"repo_name": repo_name}
         session = _new_session(repo_name, repo_meta)
         print(f"[engine] New session: {repo_name}")
     else:
