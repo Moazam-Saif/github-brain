@@ -48,7 +48,7 @@ def _get_dataset_path() -> str:
     org = os.getenv("ACTIVELOOP_ORG")
     if not org:
         raise ValueError("ACTIVELOOP_ORG is required but was not provided.")
-    return f"hub://{org}/github_brain_v2"
+    return f"hub://{org}/github_brain_v4"
 
 
 def _get_token() -> str:
@@ -63,34 +63,22 @@ def _get_token() -> str:
 # ---------------------------------------------------------------------------
 
 def get_or_create_dataset() -> deeplake.Dataset:
-    """
-    Open the existing dataset or create it fresh if it doesn't exist.
-
-    Called at the start of every read/write operation. Safe to call
-    repeatedly — it opens rather than overwrites when the dataset exists.
-
-    Tensors created:
-      embedding  float32[768]  — the chunk's semantic vector
-      text       str           — raw chunk content
-      metadata   json str      — everything else (repo_name, file_path, etc.)
-    """
     path  = _get_dataset_path()
     token = _get_token()
 
-    try:
-        ds = deeplake.load(path, token=token)
+    ds = deeplake.dataset(path, token=token)
+
+    if "embedding" not in ds.tensors:
+        print(f"[deeplake] Creating tensors in dataset: {path}")
+        ds.create_tensor("embedding", htype="embedding",
+                         dtype="float32", sample_compression=None)
+        ds.create_tensor("text",      htype="text", dtype=str)
+        ds.create_tensor("metadata",  htype="json", dtype=str)
+        print(f"[deeplake] Dataset ready.")
+    else:
         print(f"[deeplake] Opened existing dataset: {path}")
-        return ds
-    except Exception:
-        print(f"[deeplake] Creating new dataset: {path}")
-        ds = deeplake.empty(path, token=token, overwrite=False)
-        with ds:
-            ds.create_tensor("embedding", htype="embedding",
-                             dtype="float32", sample_compression=None)
-            ds.create_tensor("text",      htype="text", dtype=str)
-            ds.create_tensor("metadata",  htype="json", dtype=str)
-        print(f"[deeplake] Dataset created.")
-        return ds
+
+    return ds
 
 
 # ---------------------------------------------------------------------------
