@@ -48,7 +48,7 @@ def _get_dataset_path() -> str:
     org = os.getenv("ACTIVELOOP_ORG")
     if not org:
         raise ValueError("ACTIVELOOP_ORG is required but was not provided.")
-    return f"hub://{org}/github_brain"
+    return f"hub://{org}/github_brain_v2"
 
 
 def _get_token() -> str:
@@ -157,6 +157,10 @@ def delete_repo_chunks(repo_name: str) -> int:
     """
     ds    = get_or_create_dataset()
     total = len(ds)
+
+    if total == 0:
+        print(f"  [deeplake] Dataset is empty, nothing to delete for: {repo_name}")
+        return 0
 
     indices = []
     for i in range(total):
