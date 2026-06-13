@@ -28,21 +28,32 @@ HOW IT WORKS:
     answered from metadata — the answer is in the code itself.
 
   retrieve_repo_specific(question, repo_name, conversation_history, seen_chunk_ids)
-    Embeds an ENRICHED query (question + last 2 conversation turns) and
-    runs similarity_search filtered to that repo only. Deduplicates against
-    chunks already seen in this session so the same code isn't repeated.
+    Uses a two-layer retrieval strategy:
 
-    WHY ENRICHMENT: Follow-up questions like "how does that connect to the DB?"
-    have no meaning in isolation. Adding the prior exchange as context makes
-    the embedding capture the right semantic direction.
+    Layer 1 — Keyword-to-file mapping (up to 2 slots):
+      Before running cosine similarity, the question is scanned for strong
+      signal keywords (auth, database, route, etc.). If a match is found,
+      chunks from files whose paths contain the mapped hint strings are
+      fetched and reserved. This guarantees structurally relevant files
+      (e.g. auth.ts for an auth question) are always in context even if
+      their cosine score isn't the highest.
 
-    WHY DEDUPLICATION: Without it, the same highly-relevant chunk gets returned
-    every turn, wasting context space and making answers repetitive.
+    Layer 2 — Cosine similarity (remaining slots up to TOP_K_REPO_SPECIFIC):
+      The remaining slots are filled by standard cosine similarity search,
+      excluding files already covered by Layer 1 to avoid duplication.
+
+    WHY TWO LAYERS: Dense configuration code (e.g. a NextAuth config file)
+    doesn't naturally score high against a natural language question even
+    though it directly answers it. The keyword layer captures structural
+    knowledge (file path = file purpose) that cosine similarity can't.
+
+    Deduplication against seen_chunk_ids ensures the same chunk isn't
+    repeated across turns in a session.
 
 TOP-K VALUES:
-  cross_repo_semantic → k = 6  (wider net across all repos)
-  repo_specific       → k = 4  (focused, one repo)
-  The repo_specific search fetches k*2 then deduplicates down to k.
+  Total chunks per turn:     5  (2 keyword-reserved + 3 cosine)
+  Raw cosine fetch:          10 (double, to have headroom after dedup)
+  Keyword fetch per group:   4  (enough to cover a 2-3 chunk file fully)
 """
 
 import hashlib
@@ -59,7 +70,117 @@ from indexer.deeplake_store import (similarity_search,
 # Constants
 # ---------------------------------------------------------------------------
 
-TOP_K_REPO_SPECIFIC = 4   # chunks per turn in a repo deep-dive session
+TOP_K_REPO_SPECIFIC    = 5   # total chunks per turn in a repo deep-dive session
+KEYWORD_RESERVED_SLOTS = 2   # max slots reserved for keyword-matched chunks
+KEYWORD_FETCH_K        = 4   # how many chunks to fetch per keyword-matched file group
+
+
+# ---------------------------------------------------------------------------
+# Keyword-to-file mapping
+# ---------------------------------------------------------------------------
+
+# Maps sets of question keywords to file path hint strings.
+# A chunk is "keyword-matched" if its file_path contains any of the hint strings
+# for the matched keyword group (case-insensitive substring match).
+#
+# Structure:
+#   keywords (tuple) → file_hints (list)
+#
+# When a question contains any word from `keywords`, chunks whose file_path
+# contains any string from `file_hints` are fetched for the reserved slots.
+#
+# Multiple keyword groups can match a single question — reserved slots are
+# filled in group match order until KEYWORD_RESERVED_SLOTS is reached.
+
+KEYWORD_FILE_MAP = [
+    (
+        ("auth", "authentication", "login", "logout", "oauth", "jwt",
+         "session", "credential", "signup", "register", "password", "token"),
+        ["auth", "login", "credential", "oauth", "session"],
+    ),
+    (
+        ("database", "db", "schema", "model", "prisma", "query",
+         "migration", "orm", "sql", "mongo", "postgres", "firestore",
+         "supabase", "firebase", "mongoose"),
+        ["schema", "prisma", "db", "model", "migration", "database"],
+    ),
+    (
+        ("route", "endpoint", "api", "request", "response",
+         "handler", "middleware", "controller"),
+        ["route", "api", "middleware", "handler", "controller", "endpoint"],
+    ),
+    (
+        ("state", "store", "redux", "slice", "context",
+         "dispatch", "action", "reducer"),
+        ["store", "slice", "context", "reducer", "state"],
+    ),
+    (
+        ("component", "render", "ui", "page", "view",
+         "layout", "style", "css", "tailwind"),
+        ["component", "page", "layout", "view", "style"],
+    ),
+    (
+        ("config", "setup", "environment", "env",
+         "initialize", "bootstrap", "init"),
+        ["config", "setup", "env", "init", "bootstrap"],
+    ),
+    (
+        ("test", "spec", "unit", "integration", "mock", "fixture"),
+        ["test", "spec", "mock", "fixture", "__test__"],
+    ),
+    (
+        ("stream", "socket", "websocket", "realtime", "event",
+         "queue", "worker", "job", "cron"),
+        ["stream", "socket", "queue", "worker", "job", "event"],
+    ),
+    (
+        ("upload", "file", "storage", "image", "media", "cloud"),
+        ["upload", "storage", "media", "cloud", "file"],
+    ),
+    (
+        ("embed", "vector", "embedding", "similarity", "search", "retrieval", "index"),
+        ["embed", "vector", "retriev", "search", "index"],
+    ),
+]
+
+
+def _get_keyword_file_hints(question: str) -> list[list[str]]:
+    """
+    Scan the question for keyword matches and return the matched file hint groups.
+
+    Returns a list of hint lists — one per matched keyword group — in match order.
+    Each hint list contains file path substrings to search for.
+
+    Example:
+      question = "how does authentication work?"
+      → matches group ("auth", "authentication", ...)
+      → returns [["auth", "login", "credential", "oauth", "session"]]
+
+    Multiple groups can match:
+      question = "how does auth connect to the database?"
+      → returns [["auth", ...], ["schema", "prisma", "db", ...]]
+    """
+    question_lower = question.lower()
+    question_words = set(question_lower.replace("?", "").replace(",", "").split())
+
+    matched_hint_groups = []
+    for keywords, file_hints in KEYWORD_FILE_MAP:
+        if any(kw in question_words for kw in keywords):
+            matched_hint_groups.append(file_hints)
+
+    return matched_hint_groups
+
+
+def _file_matches_hints(file_path: str, hints: list[str]) -> bool:
+    """
+    Return True if file_path contains any of the hint strings (case-insensitive).
+
+    Example:
+      file_path = "lib/auth.ts", hints = ["auth", "login"]  → True
+      file_path = "lib/prisma.ts", hints = ["auth", "login"] → False
+    """
+    path_lower = file_path.lower()
+    return any(hint in path_lower for hint in hints)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +363,7 @@ def retrieve_repo_specific(
     seen_chunk_ids: set,
 ) -> list[dict]:
     """
-    Semantic search within a single repo, with enrichment and deduplication.
+    Two-layer semantic search within a single repo, with enrichment and deduplication.
     Used for repo_specific questions (deep dives).
 
     Parameters:
@@ -253,39 +374,106 @@ def retrieve_repo_specific(
                                new chunk IDs are added to this set by this function).
 
     Process:
-      1. Enrich the query with recent conversation context
-      2. Embed the enriched query
-      3. Search Deep Lake filtered to repo_name
-      4. Filter out chunks already seen this session
-      5. Return up to TOP_K_REPO_SPECIFIC fresh chunks
+      Layer 1 — Keyword-to-file mapping (up to KEYWORD_RESERVED_SLOTS = 2):
+        1. Scan question for keyword matches
+        2. For each matched keyword group, fetch KEYWORD_FETCH_K chunks from
+           files whose path contains the hint strings
+        3. Add fresh (not yet seen) keyword-matched chunks to results first
+        4. Stop once KEYWORD_RESERVED_SLOTS fresh keyword chunks are collected
 
-    Returns fresh chunk dicts sorted by similarity score descending.
+      Layer 2 — Cosine similarity (remaining slots up to TOP_K_REPO_SPECIFIC = 5):
+        5. Enrich query with recent conversation context
+        6. Embed enriched query
+        7. Run cosine similarity search (fetch TOP_K_REPO_SPECIFIC * 2 = 10 raw)
+        8. Skip chunks already seen OR already covered by keyword layer
+        9. Fill remaining slots with fresh cosine chunks
+
+    Returns up to TOP_K_REPO_SPECIFIC fresh chunk dicts sorted:
+      keyword-matched chunks first, then cosine chunks.
     """
-    enriched     = _build_enriched_query(question, conversation_history)
     print(f"  [retriever] Repo-specific search in '{repo_name}'")
 
-    query_vector = embed_query(enriched)
-    if query_vector is None:
-        print("  [retriever] Failed to embed query.")
-        return []
+    # -----------------------------------------------------------------------
+    # Layer 1: Keyword-to-file mapping
+    # -----------------------------------------------------------------------
+    keyword_chunks = []
+    keyword_covered_file_paths = set()  # file paths already covered by keyword layer
 
-    # Fetch double so we have headroom after deduplication.
-    raw = similarity_search(
-        query_vector=query_vector,
-        top_k=TOP_K_REPO_SPECIFIC * 2,
-        repo_name=repo_name,
-    )
+    hint_groups = _get_keyword_file_hints(question)
 
-    fresh = []
-    for chunk in raw:
-        cid = _chunk_id(chunk)
-        if cid not in seen_chunk_ids:
-            fresh.append(chunk)
-            seen_chunk_ids.add(cid)
-        if len(fresh) >= TOP_K_REPO_SPECIFIC:
-            break
+    if hint_groups:
+        print(f"  [retriever] Keyword hint groups matched: {len(hint_groups)}")
 
-    duped = len(raw) - len(fresh)
-    print(f"  [retriever] {len(fresh)} fresh chunks "
-          f"({duped} already seen this session).")
-    return fresh
+        # Embed the raw question (no enrichment) for keyword-layer search.
+        # We use the raw question here because enrichment adds prior context
+        # which could dilute the keyword signal for file matching.
+        kw_query_vector = embed_query(question)
+
+        if kw_query_vector is not None:
+            # Fetch a broad pool of chunks from this repo to filter by file path.
+            all_repo_chunks = similarity_search(
+                query_vector=kw_query_vector,
+                top_k=len(hint_groups) * KEYWORD_FETCH_K * 2,
+                repo_name=repo_name,
+            )
+
+            for hints in hint_groups:
+                if len(keyword_chunks) >= KEYWORD_RESERVED_SLOTS:
+                    break
+
+                # Find chunks from files matching this hint group.
+                matched = [
+                    c for c in all_repo_chunks
+                    if _file_matches_hints(c.get("file_path", ""), hints)
+                ]
+
+                for chunk in matched:
+                    if len(keyword_chunks) >= KEYWORD_RESERVED_SLOTS:
+                        break
+                    cid = _chunk_id(chunk)
+                    if cid not in seen_chunk_ids:
+                        keyword_chunks.append(chunk)
+                        seen_chunk_ids.add(cid)
+                        keyword_covered_file_paths.add(chunk.get("file_path", ""))
+
+        matched_files = list(keyword_covered_file_paths)
+        print(f"  [retriever] Keyword layer: {len(keyword_chunks)} chunks "
+              f"from {matched_files}")
+
+    # -----------------------------------------------------------------------
+    # Layer 2: Cosine similarity for remaining slots
+    # -----------------------------------------------------------------------
+    remaining_slots = TOP_K_REPO_SPECIFIC - len(keyword_chunks)
+    cosine_chunks   = []
+
+    if remaining_slots > 0:
+        enriched     = _build_enriched_query(question, conversation_history)
+        query_vector = embed_query(enriched)
+
+        if query_vector is not None:
+            raw = similarity_search(
+                query_vector=query_vector,
+                top_k=TOP_K_REPO_SPECIFIC * 2,
+                repo_name=repo_name,
+            )
+
+            for chunk in raw:
+                if len(cosine_chunks) >= remaining_slots:
+                    break
+                cid = _chunk_id(chunk)
+                if cid not in seen_chunk_ids:
+                    cosine_chunks.append(chunk)
+                    seen_chunk_ids.add(cid)
+
+        print(f"  [retriever] Cosine layer: {len(cosine_chunks)} chunks")
+
+    # Keyword chunks first (structurally guaranteed), then cosine chunks.
+    results = keyword_chunks + cosine_chunks
+
+    total_raw  = (len(hint_groups) * KEYWORD_FETCH_K * 2) + (TOP_K_REPO_SPECIFIC * 2)
+    total_seen = total_raw - len(results)
+    print(f"  [retriever] {len(results)} total chunks "
+          f"({len(keyword_chunks)} keyword + {len(cosine_chunks)} cosine, "
+          f"{total_seen} skipped/seen).")
+
+    return results
