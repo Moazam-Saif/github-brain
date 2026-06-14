@@ -78,12 +78,19 @@ def _index_single_repo(
             return summary
 
         # Step 2: Metadata generation.
-        # Returns (metadata dict, file_filter dict).
-        # metadata  → stored on every chunk in Deep Lake.
-        # file_filter → used only here to decide which files to fetch, then discarded.
+        # Returns (metadata dict, file_filter dict, file_roles dict, file_purposes dict).
+        # metadata      → stored on every chunk in Deep Lake.
+        # file_filter   → used only here to decide which files to fetch, then discarded.
+        # file_roles    → per-file role from README's curated list, used by chunker.py
+        #                 to build context headers. Empty dict if README had no list.
+        # file_purposes → per-file purpose description from README's curated list,
+        #                 used by chunker.py alongside file_roles. Empty dict if
+        #                 README had no list.
         print(f"  [indexer] Generating metadata...")
         source_type, source_content = client.get_metadata_file(repo_name, branch)
-        repo_metadata, file_filter  = generate_repo_metadata(repo, source_type, source_content)
+        repo_metadata, file_filter, file_roles, file_purposes = generate_repo_metadata(
+            repo, source_type, source_content
+        )
 
         # Step 3: Fetch indexable file contents.
         # file_filter tells get_indexable_files() which paths/extensions to include.
@@ -98,8 +105,12 @@ def _index_single_repo(
             return summary
 
         # Step 4: Chunk files.
+        # file_roles and file_purposes are passed through so chunker.py can build
+        # a context header for each file ("File: ... | Role: ... | Purpose: ...").
+        # For files not covered by these dicts, chunker.py falls back to
+        # filename/folder-based role inference.
         print(f"  [indexer] Chunking {len(files)} files...")
-        chunks = chunk_repo_files(files, repo_metadata)
+        chunks = chunk_repo_files(files, repo_metadata, file_roles, file_purposes)
         summary["chunks"] = len(chunks)
 
         if not chunks:

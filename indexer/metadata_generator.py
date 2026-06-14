@@ -21,6 +21,26 @@ The file_filter field is returned separately from the metadata dict.
 It drives get_indexable_files() in github_client.py. It is NOT stored
 as chunk metadata — it is only used during indexing to decide which files
 to fetch. Once indexing is done it is discarded.
+
+FILE ROLES AND PURPOSES (new):
+  When the README has a curated "important files" table with descriptions
+  (e.g. CorpLaw-AI's "Read these files" table with a "Why it matters" column),
+  Gemini extracts a per-file role (from a controlled vocabulary) and a short
+  purpose description for each listed file.
+
+  These are returned as file_roles and file_purposes dicts, keyed by file path.
+  chunker.py uses these to prepend a context header to each file's content
+  before chunking — e.g.:
+
+    File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup and NextAuth adapter configuration
+
+  This makes each chunk's embedding semantically represent what the file DOES,
+  not just its raw code — so cosine similarity correctly surfaces foundational
+  files (like auth config) even when the question doesn't use the same words
+  as the code itself.
+
+  For repos without a curated README table, file_roles and file_purposes are
+  both empty dicts — chunker.py falls back to inferring role from filename/folder.
 """
 
 import os
@@ -63,6 +83,22 @@ ALWAYS_INCLUDE_EXTENSIONS = {".md"}
 
 
 # ---------------------------------------------------------------------------
+# Controlled vocabulary for file roles
+# Must match the roles chunker.py's filename/folder inference can produce,
+# so headers are consistent whether the role came from README or inference.
+# ---------------------------------------------------------------------------
+
+VALID_FILE_ROLES = {
+    "authentication", "database", "routing", "api", "middleware",
+    "state management", "configuration", "testing",
+    "queue/background jobs", "file storage", "search/retrieval",
+    "realtime", "notifications", "caching", "payments", "logging",
+    "utilities", "ui component", "ui page", "styling", "ai/llm",
+    "api client", "other",
+}
+
+
+# ---------------------------------------------------------------------------
 # Extraction prompt
 # ---------------------------------------------------------------------------
 
@@ -97,6 +133,14 @@ Return this exact structure:
     "found": true or false,
     "paths": ["list of file paths and folder prefixes explicitly mentioned as important/worth looking at"],
     "extensions": ["list of file extensions to include, e.g. .java .cpp .py"]
+  }},
+
+  "file_roles": {{
+    "<file path exactly as in files_to_index.paths>": "<role from controlled vocabulary>"
+  }},
+
+  "file_purposes": {{
+    "<file path exactly as in files_to_index.paths>": "<one short phrase describing what this file does>"
   }}
 }}
 
@@ -138,7 +182,24 @@ Rules for files_to_index:
     • Do NOT add paths from any full project structure tree.
     • "extensions" must list every file extension present among the included paths.
 - If "found" is false, set "paths" to [] and "extensions" to [].
-- Only include paths EXPLICITLY named. Never infer or guess."""
+- Only include paths EXPLICITLY named. Never infer or guess.
+
+Rules for file_roles and file_purposes:
+- These are ONLY populated when files_to_index.found is true. If found is false,
+  return both as empty objects {{}}.
+- For EVERY file path in files_to_index.paths, provide an entry in BOTH file_roles
+  and file_purposes.
+- file_roles: assign exactly one role per file from this controlled vocabulary:
+    authentication, database, routing, api, middleware, state management,
+    configuration, testing, queue/background jobs, file storage, search/retrieval,
+    realtime, notifications, caching, payments, logging, utilities,
+    ui component, ui page, styling, ai/llm, api client, other
+  Use "other" only if none of the above genuinely fit.
+- file_purposes: a short phrase (under 15 words) describing what the file does,
+  based on the README's own description of it (e.g. a "Why it matters" or
+  description column). Do not invent details not supported by the README.
+- Keys in file_roles and file_purposes must exactly match the file paths used
+  in files_to_index.paths (same string, same casing)."""
 
 
 SOURCE_LABELS = {
@@ -164,7 +225,9 @@ def _extract_with_gemini(
 
     Returns a dict with keys:
       repo_description, repo_technologies, repo_purpose, deployment_url,
-      files_to_index { found, paths, extensions }
+      files_to_index { found, paths, extensions },
+      file_roles { <path>: <role> },
+      file_purposes { <path>: <purpose> }
 
     Falls back to safe defaults if all retries fail.
     """
@@ -233,6 +296,29 @@ def _extract_with_gemini(
                 "extensions": fti.get("extensions", []) if isinstance(fti.get("extensions"), list) else [],
             }
 
+            # Normalize file_roles.
+            roles = parsed.get("file_roles", {})
+            if not isinstance(roles, dict):
+                roles = {}
+            # Drop any role not in the controlled vocabulary — fall back to "other".
+            clean_roles = {}
+            for path, role in roles.items():
+                if isinstance(role, str) and role in VALID_FILE_ROLES:
+                    clean_roles[path] = role
+                else:
+                    clean_roles[path] = "other"
+            parsed["file_roles"] = clean_roles
+
+            # Normalize file_purposes.
+            purposes = parsed.get("file_purposes", {})
+            if not isinstance(purposes, dict):
+                purposes = {}
+            clean_purposes = {
+                path: purpose for path, purpose in purposes.items()
+                if isinstance(purpose, str) and purpose.strip()
+            }
+            parsed["file_purposes"] = clean_purposes
+
             return parsed
 
         except json.JSONDecodeError as e:
@@ -263,6 +349,8 @@ def _extract_with_gemini(
         "external_services":  [],
         "has_tests":          False,
         "files_to_index":     {"found": False, "paths": [], "extensions": []},
+        "file_roles":         {},
+        "file_purposes":      {},
     }
 
 
@@ -274,9 +362,10 @@ def generate_repo_metadata(
     github_repo: dict,
     source_type: Optional[str],
     source_content: Optional[str],
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """
-    Build the complete metadata object and file filter config for a repo.
+    Build the complete metadata object, file filter config, and per-file
+    role/purpose mappings for a repo.
 
     Parameters:
         github_repo     Repo dict from GitHubClient.get_repos().
@@ -284,7 +373,7 @@ def generate_repo_metadata(
         source_content  Raw text of the metadata source file, or None.
 
     Returns:
-        (metadata, file_filter)
+        (metadata, file_filter, file_roles, file_purposes)
 
         metadata    — dict attached to every chunk. Contains repo-level fields.
                       Does NOT contain file_filter (not needed at query time).
@@ -295,6 +384,16 @@ def generate_repo_metadata(
             "paths":      ["app.py", "src/", ...],   # explicit paths from README
             "extensions": [".py", ".java", ...],      # extensions from README or fallback
           }
+
+        file_roles    — dict {file_path: role} for files with a README-extracted role.
+                        Empty dict if files_to_index.found was false.
+
+        file_purposes — dict {file_path: purpose} for files with a README-extracted
+                        purpose description. Empty dict if files_to_index.found was false.
+
+        file_roles and file_purposes are consumed by chunker.py to build a context
+        header for each chunk. For files not present in these dicts, chunker.py
+        falls back to inferring role from filename/folder.
 
     Tiered fallback:
         README with file listing → mode: "readme", use Gemini-extracted paths + extensions
@@ -336,6 +435,8 @@ def generate_repo_metadata(
             "external_services":  [],
             "has_tests":          False,
             "files_to_index":     {"found": False, "paths": [], "extensions": []},
+            "file_roles":         {},
+            "file_purposes":      {},
         }
 
     # --- Build metadata dict (stored on every chunk). ---
@@ -395,6 +496,13 @@ def generate_repo_metadata(
         print(f"  [metadata] File filter: language fallback "
               f"({repo_language or 'unknown'}, {len(file_filter['extensions'])} extensions)")
 
+    # --- File roles and purposes (only populated when README curated a file list). ---
+    file_roles    = gemini.get("file_roles", {})
+    file_purposes = gemini.get("file_purposes", {})
+
+    if file_roles:
+        print(f"  [metadata] File roles extracted for {len(file_roles)} files")
+
     # Log summary.
     techs    = ", ".join(metadata["repo_technologies"][:5]) or "none detected"
     deployed = metadata["deployment_url"] or "not deployed"
@@ -402,4 +510,4 @@ def generate_repo_metadata(
     print(f"  [metadata] technologies: {techs}")
     print(f"  [metadata] deployment:   {deployed}")
 
-    return metadata, file_filter
+    return metadata, file_filter, file_roles, file_purposes
