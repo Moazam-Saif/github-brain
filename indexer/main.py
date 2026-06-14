@@ -136,7 +136,8 @@ def _index_single_repo(
               f"{len(chunks)} chunks, {stored} stored")
 
     except Exception as e:
-        print(f"  [indexer] ✗ Error processing {repo_name}: {e}")
+        import traceback
+        traceback.print_exc()
         summary["status"] = "error"
         summary["error"]  = str(e)
 
