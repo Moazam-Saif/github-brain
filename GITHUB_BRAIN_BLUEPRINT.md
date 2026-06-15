@@ -91,13 +91,33 @@ chunk from that repo, making the RAG system smarter.
 
 | Layer | Choice | Reason |
 |---|---|---|
-| Embeddings | Gemini `text-embedding-004` | Free tier: 100 req/min |
-| LLM | Gemini `gemini-1.5-flash` | Free tier: 15 req/min, 1M tokens/day |
-| Metadata extraction | Gemini `gemini-1.5-flash` | Same model, one call per repo |
-| Vector store | Activeloop Deep Lake | Free tier, cloud-hosted, metadata filtering |
+| Embeddings | Gemini `text-embedding-004` (Vertex AI) | Free tier: 100 req/min |
+| LLM | Gemini `gemini-2.5-flash` (Vertex AI) | Free tier: 15 req/min |
+| Metadata extraction | Same Gemini model | Same model, one call per repo |
+| Vector store | Activeloop Deep Lake (`hub://ORG/github_brain_v5`) | Free tier, cloud-hosted, metadata filtering |
 | GitHub data | GitHub REST API | 5000 req/hr with personal token |
 | Backend | FastAPI (Python) | Lightweight, async, easy to extend later |
 | Interface | CLI (Phase 1), React + TypeScript (Phase 2) | Validate core before building UI |
+
+### Authentication: Vertex AI service account, not API key
+
+`gemini_client.py` authenticates via a **GCP service account JSON**, not a Gemini API key.
+The full service account JSON is stored as a single-line string in the
+`GCP_SERVICE_ACCOUNT_JSON` environment variable. `get_client()` parses it, builds
+OAuth2 credentials, and returns `genai.Client(vertexai=True, project=..., location=...,
+credentials=...)`.
+
+`GEMINI_MODEL` is read from env (`GEMINI_MODEL`, default `gemini-2.5-flash`).
+`EMBEDDING_MODEL` is `text-embedding-004` (Vertex AI path — no `models/` prefix).
+
+### Dataset naming history
+
+The dataset went through several names due to an Activeloop constraint:
+**once a dataset is deleted from Deep Lake Cloud, that path can never be reused.**
+`github_brain` and `github_brain_v2`/`v3`/`v4` were burned this way during setup.
+The current and stable path is **`hub://ORG/github_brain_v5`**, hardcoded in
+`deeplake_store.py`'s `_get_dataset_path()`. Do not delete this dataset — see
+Section 10 for how re-indexing works without ever deleting the dataset.
 
 ---
 
@@ -132,6 +152,7 @@ Every chunk stored in Deep Lake carries this metadata:
   "metadata_confidence": "high",
   "file_path":           "src/parser.py",
   "file_type":           ".py",
+  "file_role":           "api",
   "chunk_index":         3,
   "indexed_at":          "2026-06-10T12:00:00+00:00"
 }
@@ -163,7 +184,8 @@ Every chunk stored in Deep Lake carries this metadata:
 | `metadata_confidence` | System | high / medium / low |
 | `file_path` | GitHub API | File path within repo |
 | `file_type` | System | File extension |
-| `chunk_index` | System | Position within file |
+| `file_role` | Gemini (README) or inferred from filename/folder | Controlled vocabulary — see Section 8a |
+| `chunk_index` | System | Position within file (per-file, starts at 0) |
 | `indexed_at` | System | ISO timestamp |
 
 ### Why these extra fields reduce vector search
@@ -217,7 +239,8 @@ their code chunks are stored with whatever metadata is available.
 ## 7. Gemini Extraction Prompt
 
 The full prompt is in `metadata_generator.py`. It extracts all metadata fields
-including the richer structural fields in a single Gemini call per repo.
+including the richer structural fields, plus per-file role/purpose mappings,
+in a single Gemini call per repo.
 
 Fields extracted:
 ```
@@ -239,10 +262,13 @@ external_services     third-party APIs/platforms beyond main stack
 has_tests             true/false — any testing mentioned
 
 files_to_index        found (bool), paths (list), extensions (list)
+file_roles            {file_path: role}    — only when files_to_index.found
+file_purposes         {file_path: purpose} — only when files_to_index.found
 ```
 
 All returned as a single JSON object. Parsed and validated defensively —
-wrong types are normalized to safe defaults rather than crashing.
+wrong types are normalized to safe defaults rather than crashing. Roles not
+in the controlled vocabulary (`VALID_FILE_ROLES`) are coerced to `"other"`.
 
 ---
 
@@ -253,14 +279,26 @@ wrong types are normalized to safe defaults rather than crashing.
 File selection is README-driven, not hardcoded. The system has two modes:
 
 **Mode 1 — README-driven (preferred)**
-If the README explicitly lists important files or folders (e.g. a "Project Structure"
-section, "Only the files that matter" block, or any code block listing source files
-with descriptions), Gemini extracts those paths during metadata generation.
-Only files whose paths match the extracted list are fetched and indexed.
-Files not mentioned in the README are ignored — even if their extension would normally pass.
+`files_to_index.found` is set to `true` ONLY when the README has a dedicated
+section whose heading signals an intentionally curated list of important files —
+trigger phrases: "Essential Files", "Key Files", "Read these files", "Only the
+files that matter", "Start here", "Important files", or similar.
+
+A generic "Project Structure" section or full directory tree listing ALL files
+is **NOT** a valid trigger on its own.
+
+**Priority rule:** if the README contains BOTH a full project structure tree AND
+a separately named curated section, only the curated section is used — the full
+tree is ignored entirely. This was added after CorpLaw-AI's README (which has both)
+produced inconsistent results (9 files one run, 31 the next) before this rule existed.
+
+Exclusion blocks ("Not worth looking at", "Ignore these", "Skip these") are honored —
+files mentioned there are never included even if they appear elsewhere.
+
+Only files whose paths match the extracted curated list are fetched and indexed.
 
 **Mode 2 — Language fallback**
-If the README has no explicit file listing (or there is no README), the system falls
+If the README has no curated file list (or there is no README), the system falls
 back to a language-appropriate extension set derived from the GitHub API `language` field:
 
 ```
@@ -313,6 +351,98 @@ file_filter = {
 
 ---
 
+## 8a. File Roles, Purposes, and Context Headers
+
+### The problem this solves
+
+Cosine similarity ranks chunks by semantic closeness to the question, but the
+most important chunks aren't always the closest in embedding space. A dense
+configuration file (e.g. `lib/auth.ts` containing NextAuth provider setup) doesn't
+*sound like* "how does authentication work?" even though it directly answers it.
+Files that merely *talk about* a topic in passing can outscore the file that
+actually *implements* it.
+
+### The fix: embed each chunk's purpose, not just its code
+
+Before chunking, `chunker.py` prepends a one-line context header to every file's
+content:
+
+```
+File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup and NextAuth adapter configuration
+```
+
+This header becomes part of chunk 0's embedded text, pulling that chunk's vector
+toward "authentication", "OAuth", "NextAuth" in semantic space — so a question like
+"how does authentication work?" now scores highly against `lib/auth.ts` directly.
+
+### Role/purpose resolution order
+
+1. **README-extracted** (`file_roles` / `file_purposes` from `metadata_generator.py`) —
+   only available for files in the README's curated "important files" list (Section 8,
+   Mode 1). Most accurate — comes from the repo author's own description.
+2. **Filename/folder inference** (`_infer_role_from_path` in `chunker.py`) — fallback
+   for every file not covered by README extraction, including ALL files in repos with
+   no curated list (Mode 2 / language fallback).
+3. **No match** — header is just `File: <path>`, no Role/Purpose.
+
+Purpose is only ever included if it came from the README — inferred roles never
+carry a purpose string, since there's nothing reliable to say beyond the role itself.
+
+### Controlled vocabulary (`VALID_FILE_ROLES`)
+
+```
+authentication, database, routing, api, middleware, state management,
+configuration, testing, queue/background jobs, file storage, search/retrieval,
+realtime, notifications, caching, payments, logging, utilities,
+ui component, ui page, styling, ai/llm, api client, other
+```
+
+Both the README extraction (`metadata_generator.py`) and the filename/folder
+inference (`chunker.py`) use this exact vocabulary, so headers look identical
+regardless of source.
+
+### Filename/folder inference rules
+
+Checked in order for any file not covered by README-extracted roles:
+
+1. **Filename match** (`FILENAME_ROLE_MAP`) — most specific. Checks the filename
+   (without extension) for substrings like `auth`, `controller`, `slice`, `config`,
+   `test`, `prompt`, etc. e.g. `authController.js` → `authentication`.
+2. **Folder match** (`FOLDER_ROLE_MAP`) — broader net. Checks the immediate parent
+   folder name for substrings like `models`, `routes`, `components`, `services`, etc.
+   e.g. `server/models/User.js` → `database`.
+3. **No match** → role is `None`.
+
+Both maps use case-insensitive substring matching.
+
+### Header examples
+
+```
+File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup and NextAuth adapter configuration
+File: server/controllers/authController.js | Role: authentication
+File: server/app.js
+```
+
+### Why the earlier keyword-to-file retrieval layer was removed
+
+An earlier iteration tried fixing this at *retrieval* time: scanning the question
+for keywords (auth, database, route, etc.) and reserving 2 of 5 chunk slots for
+files whose *path* matched hint strings. This was removed because:
+
+- Path substring matching produced false positives — e.g. the word "session" in
+  the auth keyword group matched `app/chat/[sessionId]/page.tsx` instead of `lib/auth.ts`.
+- It only handled black-and-white questions cleanly. Questions spanning multiple
+  concerns (e.g. "how does auth connect to the database?") or with no clean keyword
+  match (e.g. "walk me through how a user sends a message") degraded to the same
+  problem the layer was meant to fix.
+
+The context-header approach (embedding-time, not retrieval-time) works for any
+question phrasing because the chunk's own embedding already represents what the
+file does — no separate matching layer is needed. `retrieve_repo_specific()` is
+back to a single cosine search with `TOP_K_REPO_SPECIFIC = 5`.
+
+---
+
 ## 9. Indexing Pipeline — Step by Step
 
 ```
@@ -334,9 +464,11 @@ Step 3: Fetch and filter files
   Fetch file content for each included file via GitHub API
 
 Step 4: Chunk files
-  Split each file into chunks of 512 tokens
+  Prepend a one-line context header to each file's content first:
+    "File: <path> | Role: <role> | Purpose: <purpose>" (purpose only if README-sourced)
+  Split header+content into chunks of 512 tokens
   Overlap consecutive chunks by 50 tokens
-  Attach full repo metadata + file_path + file_type + chunk_index to each chunk
+  Attach full repo metadata + file_path + file_type + file_role + chunk_index to each chunk
 
 Step 5: Embed chunks
   Send chunk text to Gemini text-embedding-004
@@ -344,10 +476,13 @@ Step 5: Embed chunks
   Add delay between batches if needed
 
 Step 6: Store in Deep Lake
-  One dataset for the entire GitHub account: hub://YOUR_ORG/github_brain
+  One dataset for the entire GitHub account: hub://ORG/github_brain_v5
   Store: embedding vector + text + metadata JSON
-  overwrite=False by default — append new repos without wiping existing data
-  For re-indexing a specific repo: delete that repo's chunks first, then re-add
+  Always appends — never overwrites existing rows directly
+  For re-indexing a specific repo: delete_repo_chunks() rewrites the dataset
+  in place (load all → filter out target repo → reset dataset content via
+  deeplake.empty(overwrite=True) → re-append kept rows), then new chunks
+  for the repo are appended. See Section 10 for why this approach is used.
 ```
 
 ---
@@ -355,13 +490,58 @@ Step 6: Store in Deep Lake
 ## 10. Deep Lake Dataset Structure
 
 ```
-Dataset: hub://YOUR_ORG/github_brain
+Dataset: hub://ORG/github_brain_v5
 
 Tensors:
   embedding   → float32 (768-dim, Gemini text-embedding-004 output size)
-  text        → str     (the raw chunk content)
-  metadata    → json    (full metadata object per chunk)
+  text        → str     (the raw chunk content, chunk 0 prefixed with context header)
+  metadata    → json    (full metadata object per chunk, includes file_role)
 ```
+
+### Dataset creation (`get_or_create_dataset()`)
+
+```python
+ds = deeplake.dataset(path, token=token)   # loads if exists, creates empty if not
+if "embedding" not in ds.tensors:
+    # create all three tensors — handles both a brand-new dataset AND a
+    # broken shell (dataset exists but tensors were never created, e.g.
+    # from an earlier crash)
+    ds.create_tensor("embedding", htype="embedding", dtype="float32", sample_compression=None)
+    ds.create_tensor("text", htype="text")
+    ds.create_tensor("metadata", htype="json")
+```
+
+Note: `dtype="float32"` (a string) for the embedding tensor — NOT `dtype=str`
+(the Python class) for text/metadata. Passing the `str` class as a dtype causes
+`argument of type 'type' is not iterable` in deeplake 3.9.x.
+
+### Deletion strategy: rewrite-in-place, never `ds.pop()` or `deeplake.delete()`
+
+**`ds.pop()` is broken in deeplake 3.x** — popping a row from a dataset with
+committed history raises `OverflowError: can't convert negative int to unsigned`
+inside Deep Lake's own commit-diff tracking (`chunk_engine.py`, `pop_samples`).
+This is an internal Deep Lake bug.
+
+**`deeplake.delete()` + recreate is also unworkable** — once a dataset is deleted,
+its path can never be reused on Deep Lake Cloud. Doing this on every re-index would
+burn a new dataset name (`v6`, `v7`, `v8`, ...) every time.
+
+**The actual approach** (`delete_repo_chunks()` in `deeplake_store.py`):
+```
+1. Load all chunks (embeddings, texts, metadata) currently in the dataset
+2. Filter out rows where metadata.repo_name == target repo — keep the rest
+3. Reset dataset content IN PLACE at the same path:
+     ds = deeplake.empty(path, token=token, overwrite=True)
+   This clears all rows/tensors WITHOUT retiring the path (unlike deeplake.delete())
+4. Recreate the three tensors
+5. Re-load a clean handle via deeplake.load() (consistent with get_or_create_dataset)
+6. Re-append the kept rows from other repos
+```
+
+`store_chunks()` then appends the newly-indexed repo's chunks afterward, normally.
+
+This is the same `overwrite=True` pattern used by LangChain/LlamaIndex's
+`DeepLakeVectorStore` — well-established and safe for the same path.
 
 ---
 
@@ -404,8 +584,9 @@ Every question is classified into one of five types before any search happens.
 **repo_specific**
 ```
 "how does auth work in claimsense?" / "walk me through the parser" (active session)
+→ repo name normalized case-insensitively against indexed repo names
 → embed enriched query (question + last 2 turns) → search within repo only
-→ top-k = 4 chunks, deduplicated against already-seen chunks
+→ top-k = 5 chunks, deduplicated against already-seen chunks
 → Gemini answers with full session history as context
 → session persists across turns
 ```
@@ -462,12 +643,15 @@ Step 3d: cross_repo_comparative
   No session. Done.
 
 Step 3e: repo_specific
+  Normalize repo name case-insensitively against indexed repo names
+    (router may return slightly wrong casing on follow-ups, e.g. "Corplaw-AI"
+     vs "CorpLaw-AI" — engine.py corrects this before session lookup)
   Check session: start new or continue existing
   _manage_context_window() if history is long
   build enriched query = question + last 2 conversation turns
   embed_query(enriched) → 768-dim vector
-  similarity_search(repo_name=X, top_k=8) → filter to repo, fetch 8
-  deduplicate against seen_chunk_ids → return top 4 fresh chunks
+  similarity_search(repo_name=X, top_k=10) → filter to repo, fetch 10
+  deduplicate against seen_chunk_ids → return top 5 fresh chunks
   _build_repo_specific_prompt() → Gemini answers with history + code
   Append turn to session. Return updated session.
 ```
@@ -628,11 +812,16 @@ github-brain/
 ## 16. Environment Variables
 
 ```
-GITHUB_TOKEN=         # classic personal token, public_repo scope is enough
-ACTIVELOOP_TOKEN=     # from app.activeloop.ai
-GEMINI_API_KEY=       # from aistudio.google.com
-ACTIVELOOP_ORG=       # your Activeloop username/org
+GITHUB_TOKEN=              # classic personal token, public_repo scope is enough
+ACTIVELOOP_TOKEN=          # from app.activeloop.ai
+ACTIVELOOP_ORG=            # your Activeloop username/org
+GCP_SERVICE_ACCOUNT_JSON=  # full service account JSON, flattened to one line
+GOOGLE_CLOUD_LOCATION=     # Vertex AI region, defaults to us-central1
+GEMINI_MODEL=              # optional override, defaults to gemini-2.5-flash
 ```
+
+Note: there is no `GEMINI_API_KEY`. Authentication is via a GCP service account
+(Vertex AI), not a Gemini API key — see Section 4.
 
 ---
 
@@ -721,19 +910,29 @@ How it works:
 ---
 
 ### `indexer/metadata_generator.py`
-**Purpose:** Generate structured metadata and file filter config for each repo.
-**Owns:** One Gemini extraction call per repo. Tiered fallback logic.
+**Purpose:** Generate structured metadata, file filter config, and per-file
+role/purpose mappings for each repo.
+**Owns:** One Gemini extraction call per repo. Tiered fallback logic. Controlled
+vocabulary validation for file roles (`VALID_FILE_ROLES`).
 **Does not own:** File fetching, embedding, or storage.
 
 How it works:
 - Receives the metadata source file (README or deps file) from github_client
-- Makes ONE Gemini call that returns both repo metadata AND files_to_index in the same response
+- Makes ONE Gemini call that returns repo metadata, files_to_index, file_roles,
+  and file_purposes in the same response
 - Merges Gemini output with GitHub API fields (repo_name, language, topics always from GitHub)
-- Returns a tuple: `(metadata_dict, file_filter_dict)`
+- Returns a 4-tuple: `(metadata_dict, file_filter_dict, file_roles, file_purposes)`
   - `metadata_dict` is stored on every chunk in Deep Lake permanently
   - `file_filter_dict` is used only during indexing to decide which files to fetch, then discarded
-- If README has explicit file listing → file_filter mode = "readme"
-- If not → file_filter mode = "language_fallback" using language from GitHub API
+  - `file_roles` / `file_purposes` are `{file_path: value}` dicts, passed to
+    `chunker.py` to build context headers. Empty `{}` if `files_to_index.found` was false.
+- `files_to_index.found` requires a dedicated curated-list section (e.g. "Essential
+  Files", "Read these files") — NOT a generic Project Structure tree. If a README
+  has both, only the curated section is used (see Section 8).
+- file_roles values are validated against `VALID_FILE_ROLES` — anything else
+  becomes `"other"`.
+- If README has no curated list → file_filter mode = "language_fallback" using
+  language from GitHub API, and file_roles/file_purposes are both `{}`
 - `.md` always included via ALWAYS_INCLUDE_EXTENSIONS regardless of mode
 
 **This is NOT RAG.** It is plain structured extraction — one LLM call, document in, JSON out.
@@ -741,17 +940,29 @@ How it works:
 ---
 
 ### `indexer/chunker.py`
-**Purpose:** Split file content into overlapping chunks and attach metadata.
-**Owns:** The chunking logic and the structure of each chunk dict.
+**Purpose:** Prepend context headers, split file content into overlapping chunks,
+and attach metadata.
+**Owns:** The chunking logic, header construction, role inference, and the
+structure of each chunk dict.
 **Does not own:** File fetching or embedding.
 
 How it works:
+- Before chunking, builds a one-line context header per file: `"File: <path> |
+  Role: <role> | Purpose: <purpose>"` (Purpose only present if README-sourced).
+  See Section 8a for full details.
+- Role resolution: README-extracted (`file_roles`/`file_purposes` params) first,
+  then `_infer_role_from_path()` (filename match via `FILENAME_ROLE_MAP`, then
+  folder match via `FOLDER_ROLE_MAP`), then `None`.
+- Header is prepended to file content; the header+content string is what gets
+  sliding-windowed — so it primarily affects chunk 0's embedding.
 - Uses character-based approximation: 1 token ≈ 4 chars, so 512 tokens = 2048 chars
 - Sliding window: step = chunk_size - overlap = 2048 - 200 = 1848 chars per step
 - Each chunk carries the full repo metadata from metadata_generator plus
-  file_path, file_type, chunk_index, and indexed_at
+  file_path, file_type, file_role, chunk_index, and indexed_at
 - chunk_index is per-file (starts at 0 for each file), not global
 - Empty or whitespace-only content produces zero chunks — silently skipped
+- `chunk_file()` and `chunk_repo_files()` accept optional `file_roles` and
+  `file_purposes` dicts (from `metadata_generator.py`); default to `{}`
 
 Why overlap: prevents function/class definitions from being split across chunks
 without any surrounding context in either half.
@@ -780,8 +991,12 @@ How it works:
 **Does not own:** Embedding generation or metadata generation.
 
 How it works:
-- One dataset (`hub://ORG/github_brain`) holds all repos — no per-repo datasets
-- Each row stores: embedding (float32[768]), text (str), metadata (JSON str)
+- One dataset (`hub://ORG/github_brain_v5`) holds all repos — no per-repo datasets
+- Each row stores: embedding (float32[768]), text (str, chunk 0 includes context
+  header), metadata (JSON str, includes file_role)
+- `get_or_create_dataset()`: `deeplake.dataset(path, token=token)` loads-or-creates
+  in one call; if `"embedding" not in ds.tensors`, creates all three tensors
+  (handles both brand-new datasets and broken shells from earlier crashes)
 
 **`similarity_search()` — batch matrix multiplication:**
   1. `ds.embedding.numpy()` loads ALL vectors as matrix M shape (N, 768) — one network call
@@ -799,8 +1014,14 @@ How it works:
   5. Return top_repos repos, each with their best chunks_per_repo chunks
   Used by retrieve_cross_repo_comparative() in retriever.py.
 
-- `delete_repo_chunks()` deletes in reverse index order — forward deletion shifts
-  indices causing wrong rows to be deleted
+**`delete_repo_chunks()` — rewrite-in-place, NOT `ds.pop()`:**
+  `ds.pop()` is broken in deeplake 3.x for datasets with committed history
+  (`OverflowError: can't convert negative int to unsigned`). `deeplake.delete()`
+  permanently retires the dataset path. Instead: load all chunks, filter out the
+  target repo's rows, reset the dataset in place via `deeplake.empty(path,
+  overwrite=True)`, recreate tensors, re-append the kept rows from other repos.
+  See Section 10 for the full rationale.
+
 - `list_all_repos()` reuses `_load_all()` but ignores embeddings — only reads metadata
   to build one summary dict per unique repo_name
 
@@ -814,7 +1035,9 @@ How it works:
 How it works:
 - `index_all()` → fetches all repos, calls `_index_single_repo()` for each
 - `index_repo(name)` → finds the named repo, calls `_index_single_repo()` with delete_existing=True
-- `_index_single_repo()` runs: file_tree → metadata → files → chunks → embeddings → store
+- `_index_single_repo()` runs: file_tree → metadata (4-tuple: metadata, file_filter,
+  file_roles, file_purposes) → files → chunks (passes file_roles/file_purposes
+  through to chunker) → embeddings → store
 - Produces a summary report at the end showing ok/skipped/error counts
 
 ---
@@ -866,7 +1089,11 @@ How it works:
 
 `retrieve_repo_specific(question, repo_name, history, seen_ids)`:
   Enriches query with last 2 turns, embeds, filters to repo,
-  deduplicates, returns top-4 fresh chunks.
+  deduplicates, returns top-5 fresh chunks (TOP_K_REPO_SPECIFIC = 5,
+  fetches 10 raw and dedups down to 5). Relies on context-header-enriched
+  embeddings (Section 8a) rather than a separate keyword-matching layer —
+  an earlier keyword-to-file layer was tried and removed (see Section 8a
+  for why).
 
 ---
 
@@ -886,6 +1113,9 @@ How it works per turn:
 Session management:
 - Session is a plain Python dict, lives in memory in cli.py
 - Starts on first repo_specific question, resets on any cross-repo or list question
+- Repo name from the router is normalized case-insensitively against
+  `list_all_repos()` before session lookup — corrects follow-up questions where
+  Gemini returns slightly different casing (e.g. "Corplaw-AI" vs "CorpLaw-AI")
 - Context window: after 4 turns (8 history entries), older turns are summarized
   into one paragraph by Gemini — prevents unbounded prompt growth
 - Summarization failure is non-fatal: placeholder used so session continues
@@ -926,7 +1156,14 @@ Key decisions made during implementation that any contributor should know:
   repo as avg of its top-3 chunk scores — fair ranking for cross_repo_comparative
 - `list_all_repos()` now surfaces all new metadata fields so the metadata prompt
   gives Gemini the full picture
-- delete_repo_chunks() deletes in reverse index order to avoid index shifting bugs
+- `get_or_create_dataset()` uses `deeplake.dataset(path, token=token)` (load-or-create
+  in one call), then checks `"embedding" not in ds.tensors` to create tensors if
+  missing — handles both brand-new datasets and broken shells from earlier crashes
+- `delete_repo_chunks()` does NOT use `ds.pop()` — it's broken in deeplake 3.x
+  (`OverflowError: can't convert negative int to unsigned` on datasets with
+  committed history). Instead: rewrite-in-place — load all chunks, filter out
+  target repo's rows, reset dataset via `deeplake.empty(path, overwrite=True)`,
+  recreate tensors, re-append kept rows. See Section 10.
 
 ### query/router.py
 - Five types: added cross_repo_comparative alongside existing four
@@ -940,6 +1177,12 @@ Key decisions made during implementation that any contributor should know:
 - retrieve_cross_repo_comparative() uses similarity_search_aggregated() — fair scoring
 - TOP_K_CROSS_REPO_SEMANTIC constant removed — per-repo search doesn't use fixed k
 - retrieve_cross_repo_metadata() unchanged — no embedding, no vector search
+- retrieve_repo_specific(): TOP_K_REPO_SPECIFIC = 5 (raised from 4), single cosine
+  search, fetches 10 raw and dedups down to 5
+- An earlier keyword-to-file retrieval layer (reserved slots for path-matched
+  chunks) was implemented and then REMOVED — see Section 8a for why. Retrieval
+  is back to a single cosine search; the context-header approach at index time
+  (Section 8a) does the work that layer was trying to do, more robustly.
 
 ### query/engine.py
 - Five branches in query() — cross_repo_comparative added
@@ -947,6 +1190,9 @@ Key decisions made during implementation that any contributor should know:
   (has_authentication, database_type, key_features, external_services, etc.)
 - _build_comparative_prompt() new — structures output by repo with rank and score
 - Session resets on all cross-repo and list questions
+- repo_specific branch normalizes repo name case-insensitively against
+  list_all_repos() before session lookup — fixes follow-up questions where
+  the router returns slightly different casing (e.g. "Corplaw-AI" vs "CorpLaw-AI")
 
 ### github_client.py
 - get_indexable_files() accepts file_filter dict from metadata_generator
@@ -955,25 +1201,36 @@ Key decisions made during implementation that any contributor should know:
 - INDEXABLE_EXTENSIONS constant removed
 
 ### metadata_generator.py
-- Returns (metadata, file_filter) tuple
-- Single Gemini call now extracts all fields including new structural ones
+- Returns (metadata, file_filter, file_roles, file_purposes) — a 4-tuple, not 2
+- Single Gemini call now extracts all fields including new structural ones,
+  plus per-file file_roles and file_purposes (only when files_to_index.found)
 - New fields: has_authentication, has_database, database_type, has_api, api_style,
   has_frontend, frontend_framework, architecture_pattern, key_features,
   external_services, has_tests
 - All new fields normalized defensively — wrong types → safe defaults, never crash
+- file_roles values validated against VALID_FILE_ROLES — anything else → "other"
+- files_to_index.found requires a dedicated curated-list section (heading like
+  "Essential Files", "Read these files") — a generic Project Structure tree alone
+  does NOT set found=true. If a README has both, only the curated section is used.
 - Language fallback covers 17 languages + broad default
 - .md always included via ALWAYS_INCLUDE_EXTENSIONS
 
 ### Gemini SDK
 - All files use `google-genai` (new SDK: `from google import genai`)
   NOT `google-generativeai` (deprecated as of mid-2025)
-- Pattern: `client = genai.Client(api_key=...)`
-  `client.models.generate_content(model="gemini-1.5-flash", contents=prompt)`
+- Auth is via Vertex AI service account, NOT an API key — see Section 4
+- Pattern: `client = genai.Client(vertexai=True, project=..., location=..., credentials=...)`
+  `client.models.generate_content(model="gemini-2.5-flash", contents=prompt)`
   `client.models.embed_content(model=..., contents=text, config={"task_type": ...})`
 
 ### chunker.py
 - 1 token ≈ 4 chars approximation — no tokenizer library needed
 - chunk_index is per-file not global
+- Accepts optional file_roles/file_purposes dicts; prepends a one-line context
+  header to each file's content before chunking (Section 8a)
+- _infer_role_from_path() provides filename/folder-based role fallback for
+  files not covered by README-extracted roles
+- Each chunk now carries a file_role field in its metadata
 
 ### embedder.py
 - RETRIEVAL_DOCUMENT at index time, RETRIEVAL_QUERY at query time — mismatching degrades quality
@@ -988,20 +1245,30 @@ Key decisions made during implementation that any contributor should know:
 ## 23. Progress Tracker
 
 ```
+[x] gemini_client.py           — Vertex AI service account auth
 [x] github_client.py           — README-driven file filter, language fallback
-[x] metadata_generator.py      — rich metadata extraction: 11 structural fields + file_filter
-[x] chunker.py
+[x] metadata_generator.py      — rich metadata extraction: 11 structural fields +
+                                  file_filter + file_roles + file_purposes (4-tuple)
+[x] chunker.py                 — context headers (Role/Purpose), filename/folder
+                                  role inference fallback
 [x] embedder.py
 [x] deeplake_store.py          — batch search + per-repo search + aggregated scoring
-[x] indexer/main.py            — passes file_filter from metadata into get_indexable_files
+                                  + rewrite-in-place deletion (no ds.pop())
+[x] indexer/main.py            — passes file_filter, file_roles, file_purposes
 [x] query/router.py            — five types: list/metadata/semantic/comparative/repo_specific
-[x] query/retriever.py         — four strategies: per-repo semantic, aggregated comparative
-[x] query/engine.py            — five branches, rich metadata prompt, fair repo ranking
+[x] query/retriever.py         — TOP_K_REPO_SPECIFIC=5, single cosine search
+                                  (keyword layer removed)
+[x] query/engine.py            — five branches, rich metadata prompt, fair repo
+                                  ranking, repo-name case normalization
 [x] cli.py
-[ ] End-to-end test with real repos
+[x] End-to-end test with real repo (CorpLaw-AI) — indexing + chat working
+[ ] Full index of all 21 repos
 ```
 
 ---
 
-*Last updated: 2026-06-12*
-*Status: All modules implemented. Five query types. Rich metadata. Per-repo semantic search. Aggregated comparative scoring.*
+*Last updated: 2026-06-15*
+*Status: All modules implemented and working end-to-end on CorpLaw-AI. Dataset:
+hub://ORG/github_brain_v5. Context-header-based retrieval (no keyword layer).
+Rewrite-in-place deletion avoids the deeplake 3.x ds.pop() bug. Next: full index
+of remaining repos.*

@@ -28,9 +28,26 @@ SEARCH MODES:
   list_all_repos()                                  → return metadata summaries, no vectors
 
 WHY ONE DATASET FOR ALL REPOS:
-  Keeping everything in one dataset (hub://ORG/github_brain) lets us do
+  Keeping everything in one dataset (hub://ORG/github_brain_v5) lets us do
   cross-repo search trivially — no joining, no federation. Filtering to a
   specific repo is done after loading metadata, which is cheap.
+
+DELETION STRATEGY (rewrite-in-place, not ds.pop()):
+  Deep Lake 3.x has a known internal bug — calling ds.pop() on a dataset that
+  already has committed data raises "OverflowError: can't convert negative int
+  to unsigned" inside Deep Lake's own commit-diff tracking (chunk_engine.py).
+  This is a bug in Deep Lake itself, not in this code.
+
+  Also note: deeplake.delete() permanently retires the dataset path — "Once
+  deleted, dataset names can't be reused in the Deep Lake Cloud." So deleting
+  and recreating the dataset on every re-index would burn through path names
+  (github_brain_v6, v7, v8, ...) forever.
+
+  The fix used in delete_repo_chunks(): load everything, filter out the target
+  repo's rows in memory, reset the dataset content IN PLACE at the same path
+  using deeplake.empty(path, overwrite=True) — which resets content without
+  retiring the path — then re-append the rows from other repos. This is the
+  same pattern used by LangChain/LlamaIndex's DeepLakeVectorStore(overwrite=True).
 """
 
 import os
@@ -131,18 +148,35 @@ def store_chunks(chunks: list[dict]) -> int:
 
 def delete_repo_chunks(repo_name: str) -> int:
     """
-    Delete every chunk belonging to a specific repo.
+    Remove every chunk belonging to a specific repo.
     Called before re-indexing a repo to avoid duplicates.
 
-    Deep Lake has no filtered delete, so we:
-      1. Scan all metadata to find matching indices
-      2. Delete those indices in reverse order
+    WHY NOT ds.pop():
+      Deep Lake 3.x raises "OverflowError: can't convert negative int to
+      unsigned" inside its own commit-diff tracking (chunk_engine.py,
+      pop_samples) when popping rows from a dataset with committed history.
+      This is an internal Deep Lake bug, not something fixable from our side.
 
-    Reverse order is critical: deleting index 5 shifts everything above it
-    down by one, so if we deleted forwards we'd skip entries or hit wrong ones.
+    WHY NOT deeplake.delete() + recreate:
+      deeplake.delete() permanently retires the dataset path — the name
+      can never be reused. Doing this on every single-repo re-index would
+      require a new dataset name (v6, v7, v8, ...) every time, which is
+      unworkable.
 
-    Returns the number of chunks deleted.
+    HOW THIS WORKS INSTEAD (rewrite-in-place):
+      1. Load all chunks (embeddings, texts, metadata) currently stored.
+      2. Filter out rows belonging to repo_name — keep everything else.
+      3. Reset the dataset's content IN PLACE at the same path using
+         deeplake.empty(path, overwrite=True). This clears all rows and
+         tensors but does NOT retire the path (unlike deeplake.delete()).
+      4. Recreate the three tensors.
+      5. Re-append the kept rows (chunks belonging to other repos).
+
+    Returns the number of chunks removed for repo_name.
     """
+    path  = _get_dataset_path()
+    token = _get_token()
+
     ds    = get_or_create_dataset()
     total = len(ds)
 
@@ -150,30 +184,49 @@ def delete_repo_chunks(repo_name: str) -> int:
         print(f"  [deeplake] Dataset is empty, nothing to delete for: {repo_name}")
         return 0
 
-    indices = []
-    for i in range(total):
-        try:
-            raw = ds.metadata[i].numpy()
-            # Deep Lake can return bytes, str, or ndarray — normalise to str
-            if hasattr(raw, 'item'):
-                raw = raw.item()
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            meta = json.loads(str(raw))
-            if meta.get("repo_name") == repo_name:
-                indices.append(i)
-        except Exception:
-            continue
+    # Load everything currently in the dataset.
+    embeddings, texts, metas = _load_all(repo_name=None)
 
-    if not indices:
+    keep_indices  = [i for i, m in enumerate(metas) if m.get("repo_name") != repo_name]
+    deleted_count = total - len(keep_indices)
+
+    if deleted_count == 0:
         print(f"  [deeplake] No existing chunks found for repo: {repo_name}")
         return 0
 
-    for idx in sorted(indices, reverse=True):
-        ds.pop(idx)
+    kept_texts = [texts[i] for i in keep_indices]
+    kept_metas = [metas[i] for i in keep_indices]
 
-    print(f"  [deeplake] Deleted {len(indices)} chunks for repo: {repo_name}")
-    return len(indices)
+    if keep_indices:
+        kept_embeddings = embeddings[keep_indices]
+    else:
+        embedding_dim   = embeddings.shape[1] if embeddings.ndim == 2 else 768
+        kept_embeddings = np.empty((0, embedding_dim), dtype=np.float32)
+
+    # Reset the dataset content in place — does NOT retire the path.
+    ds = deeplake.empty(path, token=token, overwrite=True)
+    with ds:
+        ds.create_tensor("embedding", htype="embedding",
+                         dtype="float32", sample_compression=None)
+        ds.create_tensor("text",      htype="text")
+        ds.create_tensor("metadata",  htype="json")
+
+    # Re-load a clean handle, consistent with get_or_create_dataset's pattern.
+    ds = deeplake.load(path, token=token)
+
+    # Re-append rows from other repos.
+    if kept_texts:
+        with ds:
+            for i in range(len(kept_texts)):
+                ds.append({
+                    "embedding": np.array(kept_embeddings[i], dtype=np.float32),
+                    "text":      kept_texts[i],
+                    "metadata":  json.dumps(kept_metas[i]),
+                })
+
+    print(f"  [deeplake] Deleted {deleted_count} chunks for repo: {repo_name} "
+          f"({len(kept_texts)} chunks from other repos preserved)")
+    return deleted_count
 
 
 # ---------------------------------------------------------------------------
