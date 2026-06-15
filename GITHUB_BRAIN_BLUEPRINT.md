@@ -95,6 +95,7 @@ chunk from that repo, making the RAG system smarter.
 | LLM | Gemini `gemini-2.5-flash` (Vertex AI) | Free tier: 15 req/min |
 | Metadata extraction | Same Gemini model | Same model, one call per repo |
 | Vector store | Activeloop Deep Lake (`hub://ORG/github_brain_v5`) | Free tier, cloud-hosted, metadata filtering |
+| Retrieval | **Hybrid Search: BM25 + cosine via RRF** | Fixes pure-cosine failure mode (see Section 22) |
 | GitHub data | GitHub REST API | 5000 req/hr with personal token |
 | Backend | FastAPI (Python) | Lightweight, async, easy to extend later |
 | Interface | CLI (Phase 1), React + TypeScript (Phase 2) | Validate core before building UI |
@@ -299,21 +300,7 @@ Only files whose paths match the extracted curated list are fetched and indexed.
 
 **Mode 2 — Language fallback**
 If the README has no curated file list (or there is no README), the system falls
-back to a language-appropriate extension set derived from the GitHub API `language` field:
-
-```
-Python     → .py .pyi
-JavaScript → .js .mjs .cjs .jsx
-TypeScript → .ts .tsx
-Java       → .java
-C++        → .cpp .cc .cxx .h .hpp .hxx
-C          → .c .h
-C#         → .cs
-Go         → .go
-Rust       → .rs
-CMake      → .cmake + CMakeLists.txt
-...and so on. Falls back to a broad multi-language default if language is unknown.
-```
+back to a language-appropriate extension set derived from the GitHub API `language` field.
 
 `.md` files are always included regardless of mode (READMEs provide context).
 
@@ -332,22 +319,6 @@ Skip any file larger than 50KB — almost always generated or minified.
 `metadata_generator.py` returns a `file_filter` dict alongside the metadata dict.
 It is passed to `github_client.get_indexable_files()` and then discarded.
 It is never stored in Deep Lake — it is only used during indexing.
-
-```python
-# README-driven example
-file_filter = {
-    "mode":       "readme",
-    "paths":      ["app.py", "src/", "server/controllers/", "templates/"],
-    "extensions": [".py", ".html", ".md"],
-}
-
-# Language fallback example
-file_filter = {
-    "mode":       "language_fallback",
-    "paths":      [],
-    "extensions": [".java", ".md"],
-}
-```
 
 ---
 
@@ -372,8 +343,16 @@ File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup and NextA
 ```
 
 This header becomes part of chunk 0's embedded text, pulling that chunk's vector
-toward "authentication", "OAuth", "NextAuth" in semantic space — so a question like
-"how does authentication work?" now scores highly against `lib/auth.ts` directly.
+toward "authentication", "OAuth", "NextAuth" in semantic space.
+
+### Why context headers alone are not sufficient
+
+In practice (confirmed with CorpLaw-AI), the context header improves embedding
+quality but does not guarantee the auth file wins the cosine similarity ranking.
+Files with high volumes of semantically adjacent content (e.g. session management
+code that co-occurs with auth in the embedding model's training data) can still
+outscore the actual auth file. This is why hybrid search (Section 22) was added —
+the two techniques complement each other.
 
 ### Role/purpose resolution order
 
@@ -397,50 +376,6 @@ realtime, notifications, caching, payments, logging, utilities,
 ui component, ui page, styling, ai/llm, api client, other
 ```
 
-Both the README extraction (`metadata_generator.py`) and the filename/folder
-inference (`chunker.py`) use this exact vocabulary, so headers look identical
-regardless of source.
-
-### Filename/folder inference rules
-
-Checked in order for any file not covered by README-extracted roles:
-
-1. **Filename match** (`FILENAME_ROLE_MAP`) — most specific. Checks the filename
-   (without extension) for substrings like `auth`, `controller`, `slice`, `config`,
-   `test`, `prompt`, etc. e.g. `authController.js` → `authentication`.
-2. **Folder match** (`FOLDER_ROLE_MAP`) — broader net. Checks the immediate parent
-   folder name for substrings like `models`, `routes`, `components`, `services`, etc.
-   e.g. `server/models/User.js` → `database`.
-3. **No match** → role is `None`.
-
-Both maps use case-insensitive substring matching.
-
-### Header examples
-
-```
-File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup and NextAuth adapter configuration
-File: server/controllers/authController.js | Role: authentication
-File: server/app.js
-```
-
-### Why the earlier keyword-to-file retrieval layer was removed
-
-An earlier iteration tried fixing this at *retrieval* time: scanning the question
-for keywords (auth, database, route, etc.) and reserving 2 of 5 chunk slots for
-files whose *path* matched hint strings. This was removed because:
-
-- Path substring matching produced false positives — e.g. the word "session" in
-  the auth keyword group matched `app/chat/[sessionId]/page.tsx` instead of `lib/auth.ts`.
-- It only handled black-and-white questions cleanly. Questions spanning multiple
-  concerns (e.g. "how does auth connect to the database?") or with no clean keyword
-  match (e.g. "walk me through how a user sends a message") degraded to the same
-  problem the layer was meant to fix.
-
-The context-header approach (embedding-time, not retrieval-time) works for any
-question phrasing because the chunk's own embedding already represents what the
-file does — no separate matching layer is needed. `retrieve_repo_specific()` is
-back to a single cosine search with `TOP_K_REPO_SPECIFIC = 5`.
-
 ---
 
 ## 9. Indexing Pipeline — Step by Step
@@ -456,10 +391,8 @@ Step 2: Per-repo metadata generation
   Run tiered fallback logic to pick metadata source
   Make Gemini extraction call if source is readme/package/requirements/pyproject
   Merge Gemini output with GitHub API fields into final metadata object
-  Cache result — skip this step on re-index if nothing changed (future optimization)
 
 Step 3: Fetch and filter files
-  Using file tree from Step 2 (already fetched)
   Apply include/exclude rules and 50KB size limit
   Fetch file content for each included file via GitHub API
 
@@ -482,7 +415,7 @@ Step 6: Store in Deep Lake
   For re-indexing a specific repo: delete_repo_chunks() rewrites the dataset
   in place (load all → filter out target repo → reset dataset content via
   deeplake.empty(overwrite=True) → re-append kept rows), then new chunks
-  for the repo are appended. See Section 10 for why this approach is used.
+  for the repo are appended.
 ```
 
 ---
@@ -503,45 +436,21 @@ Tensors:
 ```python
 ds = deeplake.dataset(path, token=token)   # loads if exists, creates empty if not
 if "embedding" not in ds.tensors:
-    # create all three tensors — handles both a brand-new dataset AND a
-    # broken shell (dataset exists but tensors were never created, e.g.
-    # from an earlier crash)
     ds.create_tensor("embedding", htype="embedding", dtype="float32", sample_compression=None)
     ds.create_tensor("text", htype="text")
     ds.create_tensor("metadata", htype="json")
 ```
 
-Note: `dtype="float32"` (a string) for the embedding tensor — NOT `dtype=str`
-(the Python class) for text/metadata. Passing the `str` class as a dtype causes
-`argument of type 'type' is not iterable` in deeplake 3.9.x.
-
 ### Deletion strategy: rewrite-in-place, never `ds.pop()` or `deeplake.delete()`
 
-**`ds.pop()` is broken in deeplake 3.x** — popping a row from a dataset with
-committed history raises `OverflowError: can't convert negative int to unsigned`
-inside Deep Lake's own commit-diff tracking (`chunk_engine.py`, `pop_samples`).
-This is an internal Deep Lake bug.
+**`ds.pop()` is broken in deeplake 3.x** — raises `OverflowError: can't convert
+negative int to unsigned` inside Deep Lake's own commit-diff tracking.
 
-**`deeplake.delete()` + recreate is also unworkable** — once a dataset is deleted,
-its path can never be reused on Deep Lake Cloud. Doing this on every re-index would
-burn a new dataset name (`v6`, `v7`, `v8`, ...) every time.
+**`deeplake.delete()` + recreate is also unworkable** — path can never be reused.
 
 **The actual approach** (`delete_repo_chunks()` in `deeplake_store.py`):
-```
-1. Load all chunks (embeddings, texts, metadata) currently in the dataset
-2. Filter out rows where metadata.repo_name == target repo — keep the rest
-3. Reset dataset content IN PLACE at the same path:
-     ds = deeplake.empty(path, token=token, overwrite=True)
-   This clears all rows/tensors WITHOUT retiring the path (unlike deeplake.delete())
-4. Recreate the three tensors
-5. Re-load a clean handle via deeplake.load() (consistent with get_or_create_dataset)
-6. Re-append the kept rows from other repos
-```
-
-`store_chunks()` then appends the newly-indexed repo's chunks afterward, normally.
-
-This is the same `overwrite=True` pattern used by LangChain/LlamaIndex's
-`DeepLakeVectorStore` — well-established and safe for the same path.
+load all → filter out target repo → reset via `deeplake.empty(overwrite=True)` →
+recreate tensors → re-append kept rows.
 
 ---
 
@@ -549,57 +458,11 @@ This is the same `overwrite=True` pattern used by LangChain/LlamaIndex's
 
 Every question is classified into one of five types before any search happens.
 
-**list_repos**
-```
-"what repos do I have?" / "show me my projects"
-→ list_all_repos() from metadata, no vector search
-→ Gemini formats the list conversationally
-```
-
-**cross_repo_metadata**
-```
-"do I have anything using Redis?" / "which repos are deployed?"
-→ list_all_repos() — returns every repo's metadata summary
-→ Gemini filters and answers from that metadata
-→ no embeddings, no vector search — fastest path
-```
-
-**cross_repo_semantic**
-```
-"do any of my repos implement rate limiting?"
-→ embed question → similarity_search across ALL chunks (no repo filter)
-→ top-k = 6 chunks from whichever repos scored highest
-→ Gemini answers: find/not-find, not a ranking
-```
-
-**cross_repo_comparative**
-```
-"which repo has the best authentication?"
-→ embed question → similarity_search_aggregated (candidate_k=50)
-→ group chunks by repo, score each repo = avg of its top-3 chunk scores
-→ rank repos, take top-3 repos × top-3 chunks each
-→ Gemini compares fairly — each repo gets equal representation
-```
-
-**repo_specific**
-```
-"how does auth work in claimsense?" / "walk me through the parser" (active session)
-→ repo name normalized case-insensitively against indexed repo names
-→ embed enriched query (question + last 2 turns) → search within repo only
-→ top-k = 5 chunks, deduplicated against already-seen chunks
-→ Gemini answers with full session history as context
-→ session persists across turns
-```
-
-### Why cross_repo_semantic and cross_repo_comparative are different
-
-cross_repo_semantic returns the global top-k chunks. For "do any repos use WebSockets?"
-this is fine — you just need to find relevant chunks somewhere.
-
-cross_repo_comparative cannot use global top-k. For "which repo has the best auth?",
-global top-k would return 5-6 chunks all from the one repo with the most auth code,
-completely ignoring other repos. The aggregated approach scores each repo independently
-so the comparison is fair regardless of repo size or chunk count.
+**list_repos** → list_all_repos() from metadata, no vector search
+**cross_repo_metadata** → list_all_repos(), Gemini filters, no vector search
+**cross_repo_semantic** → similarity_search_per_repo() — one chunk per repo
+**cross_repo_comparative** → similarity_search_aggregated() — fair repo ranking
+**repo_specific** → hybrid_search() within one repo + session history
 
 ---
 
@@ -616,44 +479,27 @@ Step 2: Route the question (one Gemini call → router.py)
     {"type": "cross_repo_comparative"}
     {"type": "repo_specific", "repo": "claimsense"}
 
-Step 3a: list_repos
-  list_all_repos() → all repo metadata summaries
-  _build_metadata_prompt() → Gemini answers
-  No session. Done.
-
-Step 3b: cross_repo_metadata
-  list_all_repos() → all repo metadata summaries
-  _build_metadata_prompt() → Gemini filters and answers
-  No vector search. No embeddings. No session. Done.
+Step 3a/3b: list_repos / cross_repo_metadata
+  list_all_repos() → all repo metadata summaries → Gemini answers
+  No vector search. No session.
 
 Step 3c: cross_repo_semantic
-  embed_query(question) → 768-dim vector
-  similarity_search(repo_name=None, top_k=6) → 6 highest-scoring chunks globally
-  _build_semantic_prompt() → Gemini answers
-  No session. Done.
+  embed_query(question) → similarity_search_per_repo() → one chunk per repo
+  Gemini answers find/not-find. No session.
 
 Step 3d: cross_repo_comparative
-  embed_query(question) → 768-dim vector
-  similarity_search_aggregated(candidate_k=50, top_repos=3, chunks_per_repo=3)
-    → fetch top-50 chunks globally
-    → group by repo_name
-    → score each repo = avg of its top-3 chunk scores
-    → rank repos, return top-3 with best 3 chunks each
-  _build_comparative_prompt() → Gemini compares repos fairly
-  No session. Done.
+  embed_query(question) → similarity_search_aggregated(candidate_k=50)
+  → group by repo → top-3 avg score → rank → Gemini compares. No session.
 
 Step 3e: repo_specific
-  Normalize repo name case-insensitively against indexed repo names
-    (router may return slightly wrong casing on follow-ups, e.g. "Corplaw-AI"
-     vs "CorpLaw-AI" — engine.py corrects this before session lookup)
-  Check session: start new or continue existing
+  Normalize repo name case-insensitively
+  Start or continue session
   _manage_context_window() if history is long
-  build enriched query = question + last 2 conversation turns
-  embed_query(enriched) → 768-dim vector
-  similarity_search(repo_name=X, top_k=10) → filter to repo, fetch 10
-  deduplicate against seen_chunk_ids → return top 5 fresh chunks
-  _build_repo_specific_prompt() → Gemini answers with history + code
-  Append turn to session. Return updated session.
+  Build enriched query (question + last 2 turns)
+  embed_query(enriched) + hybrid_search(enriched, repo_name=X, top_k=20)
+  → deduplicate → return top 5 fresh chunks
+  Gemini answers with history + code context
+  Append turn to session.
 ```
 
 ---
@@ -662,82 +508,28 @@ Step 3e: repo_specific
 
 ### Why sessions are needed
 
-A deep dive is a conversation, not a single query. Each follow-up gives
-more signal about what the user is looking for. Without session state,
-every question is answered in isolation and the system loses all context
-from previous turns.
+A deep dive is a conversation, not a single query. Without session state,
+every question is answered in isolation.
 
 ### Session object
 
-Lives in memory for the duration of the CLI conversation. No database needed.
-
 ```python
 session = {
-    "active_repo":         "claimsense",   # which repo is in focus
-    "conversation_history": [              # running list of turns
+    "active_repo":         "claimsense",
+    "conversation_history": [
         {"role": "user",      "content": "how does the PDF parser work?"},
         {"role": "assistant", "content": "The parser uses pdfplumber to..."}
     ],
-    "seen_chunk_ids":      set(),          # deduplication — chunk hashes already used
-    "repo_metadata":       {...}           # loaded once at session start, reused every turn
+    "seen_chunk_ids":      set(),
+    "repo_metadata":       {...}
 }
 ```
 
 ### Conversation-aware retrieval
 
-The query sent to Deep Lake is NOT the raw user message — it is enriched
-with prior context so the vector search finds better matches:
-
-```
-# Naive (bad)
-search_query = "how does that feed into the verification step?"
-
-# Enriched (good)
-search_query = """
-Previous context: PDF parsing using pdfplumber, extracts fields into dict
-Current question: how does that feed into the verification step?
-"""
-```
-
-The enriched query produces far better vector matches because it carries
-semantic context from the conversation. Use the last 2 turns as context
-for enrichment — going further back adds noise.
-
-### Deduplication
-
-Without deduplication, the same highly-similar chunks are retrieved
-repeatedly across turns, wasting context space and confusing the LLM.
-
-Every retrieved chunk gets hashed and added to seen_chunk_ids.
-On subsequent turns, chunks already in seen_chunk_ids are filtered out
-before being added to the context window.
-
-### Context window structure per turn
-
-```
-[system prompt]                    ← fixed, describes the assistant's role
-[repo metadata summary]            ← one paragraph, loaded once at session start
-[summarized older turns]           ← older history compressed into one paragraph
-[last 4 conversation turns]        ← recent history kept verbatim
-[newly retrieved chunks]           ← fresh code context for this question
-[current user question]            ← the actual question
-```
-
-### Sliding window with summarization
-
-Conversation history cannot grow indefinitely. Management strategy:
-
-```
-Keep always:
-  - System prompt
-  - Repo metadata summary
-  - Last 4 turns verbatim
-
-When history exceeds 4 turns:
-  - Older turns are summarized into one paragraph by Gemini
-  - That summary replaces the raw older turns
-  - Prevents context window bloat without losing conversational continuity
-```
+The enriched query is used for BOTH the cosine embedding and BM25 tokenization
+in hybrid_search — enrichment adds context words that help BM25 find relevant
+follow-up chunks too, not just the cosine component.
 
 ### Session lifecycle
 
@@ -749,34 +541,20 @@ Session resets    → user asks cross_repo_metadata, cross_repo_semantic, or lis
                   → user types "reset" in the CLI
 ```
 
-When a session resets, conversation_history and seen_chunk_ids are cleared.
-repo_metadata is re-loaded if the new repo is different.
-
 ---
 
 ## 14. Query Router Prompt
 
-See `query/router.py` for the full prompt. Summary of classification rules:
+See `query/router.py` for the full prompt. Five types:
 
 ```
 list_repos          → user wants to list, count, or browse repos
-                      "what repos do I have?" / "show me my projects"
-
-cross_repo_metadata → question about technology, language, deployment, or
-                      project category answerable from stored metadata
-                      "do I have anything using Redis?"
-                      "which repos are deployed?"
-                      "do I have any Java projects?"
-
-cross_repo_semantic → question about concept or pattern requiring actual code
-                      "which repo implements rate limiting?"
-                      "do any repos handle file uploads?"
-
+cross_repo_metadata → technology, language, deployment answerable from metadata
+cross_repo_semantic → concept/pattern requiring actual code (find/not-find)
+cross_repo_comparative → ranks or compares repos on some quality (needs code)
 repo_specific       → targets one repo by name or active session
-                      "how does auth work in claimsense?"
-                      "walk me through the parser" (active session)
 
-Fallback: cross_repo_semantic (safe — searches broadly rather than wrong repo)
+Fallback: cross_repo_semantic
 ```
 
 ---
@@ -787,24 +565,23 @@ Fallback: cross_repo_semantic (safe — searches broadly rather than wrong repo)
 github-brain/
 │
 ├── indexer/
-│   ├── main.py                  ← orchestrates full pipeline, CLI entry point
-│   ├── github_client.py         ← all GitHub API calls (fetch repos, files, trees)
-│   ├── metadata_generator.py    ← tiered fallback logic + Gemini extraction call
-│   ├── chunker.py               ← splits file text into overlapping token chunks
-│   ├── embedder.py              ← sends chunks to Gemini embedding API
-│   └── deeplake_store.py        ← all Deep Lake read/write operations
+│   ├── main.py
+│   ├── github_client.py
+│   ├── metadata_generator.py
+│   ├── chunker.py
+│   ├── embedder.py
+│   └── deeplake_store.py        ← hybrid_search() added
 │
 ├── query/
-│   ├── engine.py                ← main query function (router + search + answer)
-│   ├── router.py                ← classifies question type via Gemini
-│   └── retriever.py             ← Deep Lake similarity search with optional filtering
+│   ├── engine.py
+│   ├── router.py
+│   └── retriever.py             ← uses hybrid_search for repo_specific
 │
-├── cli.py                       ← interactive CLI loop (Phase 1 interface)
-│
-├── .env                         ← API keys (never committed)
-├── .env.example                 ← template showing required keys
-├── requirements.txt
-└── BLUEPRINT.md                 ← this file
+├── cli.py
+├── .env
+├── .env.example
+├── requirements.txt             ← rank-bm25 added
+└── BLUEPRINT.md
 ```
 
 ---
@@ -812,16 +589,13 @@ github-brain/
 ## 16. Environment Variables
 
 ```
-GITHUB_TOKEN=              # classic personal token, public_repo scope is enough
-ACTIVELOOP_TOKEN=          # from app.activeloop.ai
-ACTIVELOOP_ORG=            # your Activeloop username/org
-GCP_SERVICE_ACCOUNT_JSON=  # full service account JSON, flattened to one line
-GOOGLE_CLOUD_LOCATION=     # Vertex AI region, defaults to us-central1
-GEMINI_MODEL=              # optional override, defaults to gemini-2.5-flash
+GITHUB_TOKEN=
+ACTIVELOOP_TOKEN=
+ACTIVELOOP_ORG=
+GCP_SERVICE_ACCOUNT_JSON=
+GOOGLE_CLOUD_LOCATION=     # defaults to us-central1
+GEMINI_MODEL=              # optional, defaults to gemini-2.5-flash
 ```
-
-Note: there is no `GEMINI_API_KEY`. Authentication is via a GCP service account
-(Vertex AI), not a Gemini API key — see Section 4.
 
 ---
 
@@ -849,6 +623,7 @@ python cli.py chat
 | GitHub API | 5000 req/hr with token | Paginate carefully, reuse file tree |
 | Deep Lake free tier | Storage limits apply | One dataset, efficient chunking |
 | File size | Skip > 50KB | Avoids generated/minified files |
+| BM25 index | Built in-memory per query | Negligible cost for <10k chunks |
 
 ---
 
@@ -861,414 +636,156 @@ python cli.py chat
 - React frontend (Phase 2)
 - Authentication / multi-user support
 - Docker metadata fields (is_dockerized, has_ci_cd)
+- Qodo-Embed model (code-specific embeddings — better long-term, requires full re-index)
 
 ---
 
 ## 20. Build Order
 
 ```
-1. github_client.py          ← fetch repos and files
-2. metadata_generator.py     ← tiered fallback + Gemini extraction
-3. chunker.py                ← split files into chunks
-4. embedder.py               ← embed chunks via Gemini
-5. deeplake_store.py         ← store and retrieve from Deep Lake
-6. indexer/main.py           ← wire 1-5 together into full pipeline
-7. query/router.py           ← classify question type
-8. query/retriever.py        ← similarity search with metadata filtering
-9. query/engine.py           ← full query flow
-10. cli.py                   ← interactive interface
+1. github_client.py
+2. metadata_generator.py
+3. chunker.py
+4. embedder.py
+5. deeplake_store.py          ← hybrid_search() is the primary search function
+6. indexer/main.py
+7. query/router.py
+8. query/retriever.py         ← retrieve_repo_specific uses hybrid_search
+9. query/engine.py
+10. cli.py
 ```
-
-Each module is tested independently before wiring together.
 
 ---
 
 ## 21. File Purposes and How Each File Works
 
-A complete reference for every file in the project. Read this to understand
-what a file owns, what it does not own, and how it connects to other files.
-
----
-
-### `indexer/github_client.py`
-**Purpose:** The only file that talks to the GitHub REST API.
-**Owns:** Fetching repo lists, file trees, file content, metadata candidate files.
-**Does not own:** Any business logic about what to do with the data.
-
-How it works:
-- Uses a persistent `requests.Session` so auth headers are set once, not per call
-- `get_repos()` paginates through all repos and filters out forks/archived/private
-- `get_file_tree()` fetches the full recursive tree in one call (`?recursive=1`)
-  and caches it — the same tree is used for metadata detection AND file fetching
-- `get_metadata_file()` tries README → package.json → requirements.txt → pyproject.toml
-  in order, returns on the first hit
-- `get_indexable_files()` accepts a `file_filter` dict from metadata_generator.
-  In "readme" mode: matches paths by prefix or exact filename.
-  In "language_fallback" mode: matches by extension, skips excluded directories.
-- Rate limit handling: reads `X-RateLimit-Reset` header and sleeps until reset
-
----
-
-### `indexer/metadata_generator.py`
-**Purpose:** Generate structured metadata, file filter config, and per-file
-role/purpose mappings for each repo.
-**Owns:** One Gemini extraction call per repo. Tiered fallback logic. Controlled
-vocabulary validation for file roles (`VALID_FILE_ROLES`).
-**Does not own:** File fetching, embedding, or storage.
-
-How it works:
-- Receives the metadata source file (README or deps file) from github_client
-- Makes ONE Gemini call that returns repo metadata, files_to_index, file_roles,
-  and file_purposes in the same response
-- Merges Gemini output with GitHub API fields (repo_name, language, topics always from GitHub)
-- Returns a 4-tuple: `(metadata_dict, file_filter_dict, file_roles, file_purposes)`
-  - `metadata_dict` is stored on every chunk in Deep Lake permanently
-  - `file_filter_dict` is used only during indexing to decide which files to fetch, then discarded
-  - `file_roles` / `file_purposes` are `{file_path: value}` dicts, passed to
-    `chunker.py` to build context headers. Empty `{}` if `files_to_index.found` was false.
-- `files_to_index.found` requires a dedicated curated-list section (e.g. "Essential
-  Files", "Read these files") — NOT a generic Project Structure tree. If a README
-  has both, only the curated section is used (see Section 8).
-- file_roles values are validated against `VALID_FILE_ROLES` — anything else
-  becomes `"other"`.
-- If README has no curated list → file_filter mode = "language_fallback" using
-  language from GitHub API, and file_roles/file_purposes are both `{}`
-- `.md` always included via ALWAYS_INCLUDE_EXTENSIONS regardless of mode
-
-**This is NOT RAG.** It is plain structured extraction — one LLM call, document in, JSON out.
-
----
-
-### `indexer/chunker.py`
-**Purpose:** Prepend context headers, split file content into overlapping chunks,
-and attach metadata.
-**Owns:** The chunking logic, header construction, role inference, and the
-structure of each chunk dict.
-**Does not own:** File fetching or embedding.
-
-How it works:
-- Before chunking, builds a one-line context header per file: `"File: <path> |
-  Role: <role> | Purpose: <purpose>"` (Purpose only present if README-sourced).
-  See Section 8a for full details.
-- Role resolution: README-extracted (`file_roles`/`file_purposes` params) first,
-  then `_infer_role_from_path()` (filename match via `FILENAME_ROLE_MAP`, then
-  folder match via `FOLDER_ROLE_MAP`), then `None`.
-- Header is prepended to file content; the header+content string is what gets
-  sliding-windowed — so it primarily affects chunk 0's embedding.
-- Uses character-based approximation: 1 token ≈ 4 chars, so 512 tokens = 2048 chars
-- Sliding window: step = chunk_size - overlap = 2048 - 200 = 1848 chars per step
-- Each chunk carries the full repo metadata from metadata_generator plus
-  file_path, file_type, file_role, chunk_index, and indexed_at
-- chunk_index is per-file (starts at 0 for each file), not global
-- Empty or whitespace-only content produces zero chunks — silently skipped
-- `chunk_file()` and `chunk_repo_files()` accept optional `file_roles` and
-  `file_purposes` dicts (from `metadata_generator.py`); default to `{}`
-
-Why overlap: prevents function/class definitions from being split across chunks
-without any surrounding context in either half.
-
----
-
-### `indexer/embedder.py`
-**Purpose:** Convert text into 768-dimensional semantic vectors.
-**Owns:** All calls to Gemini's text-embedding-004 model.
-**Does not own:** What to do with the vectors.
-
-How it works:
-- `embed_chunks()` — called at index time, uses `task_type="RETRIEVAL_DOCUMENT"`
-- `embed_query()` — called at query time, uses `task_type="RETRIEVAL_QUERY"`
-- The asymmetry matters: Gemini's embedding model produces slightly different
-  vector spaces for documents vs queries. Mismatching them degrades search quality.
-- Rate limiting: 0.65s sleep between calls stays under 100 req/min free tier
-- Failed embeddings return None and are filtered out before storage
-
----
-
 ### `indexer/deeplake_store.py`
-**Purpose:** All read and write operations against the Deep Lake vector database.
-**Owns:** Dataset creation, chunk storage, chunk deletion, similarity search,
-          aggregated repo-level search, repo listing.
-**Does not own:** Embedding generation or metadata generation.
+**Primary search function: `hybrid_search()`** — BM25 + cosine similarity fused
+via Reciprocal Rank Fusion (RRF). Used by `retrieve_repo_specific()`.
 
-How it works:
-- One dataset (`hub://ORG/github_brain_v5`) holds all repos — no per-repo datasets
-- Each row stores: embedding (float32[768]), text (str, chunk 0 includes context
-  header), metadata (JSON str, includes file_role)
-- `get_or_create_dataset()`: `deeplake.dataset(path, token=token)` loads-or-creates
-  in one call; if `"embedding" not in ds.tensors`, creates all three tensors
-  (handles both brand-new datasets and broken shells from earlier crashes)
+`similarity_search()` is kept as a cosine-only fallback used internally by
+`similarity_search_aggregated()` and `similarity_search_per_repo()`. These
+cross-repo functions don't need hybrid search — their fairness problems are
+solved at the aggregation/per-repo level, not at the term-matching level.
 
-**`similarity_search()` — batch matrix multiplication:**
-  1. `ds.embedding.numpy()` loads ALL vectors as matrix M shape (N, 768) — one network call
-  2. Normalize M and query vector to unit length
-  3. `M @ query_vector` — one matrix multiply gives N cosine scores simultaneously
-  4. `np.argsort` to find top-k indices
-  Replaces old per-row loop (N network calls, ~60s) with 1 call + 1 multiply (~1s).
-
-**`similarity_search_aggregated()` — repo-level scoring for comparative questions:**
-  1. Call similarity_search(candidate_k=50) — broad search across all chunks
-  2. Group chunks by repo_name
-  3. For each repo: repo_score = average of its top-3 chunk scores
-     (top-3 average is fair across repo sizes — not biased by chunk count)
-  4. Rank repos by repo_score descending
-  5. Return top_repos repos, each with their best chunks_per_repo chunks
-  Used by retrieve_cross_repo_comparative() in retriever.py.
-
-**`delete_repo_chunks()` — rewrite-in-place, NOT `ds.pop()`:**
-  `ds.pop()` is broken in deeplake 3.x for datasets with committed history
-  (`OverflowError: can't convert negative int to unsigned`). `deeplake.delete()`
-  permanently retires the dataset path. Instead: load all chunks, filter out the
-  target repo's rows, reset the dataset in place via `deeplake.empty(path,
-  overwrite=True)`, recreate tensors, re-append the kept rows from other repos.
-  See Section 10 for the full rationale.
-
-- `list_all_repos()` reuses `_load_all()` but ignores embeddings — only reads metadata
-  to build one summary dict per unique repo_name
-
----
-
-### `indexer/main.py`
-**Purpose:** Orchestrate the full indexing pipeline for one or all repos.
-**Owns:** The order of pipeline steps and the indexing summary report.
-**Does not own:** Any individual step — it only calls other modules.
-
-How it works:
-- `index_all()` → fetches all repos, calls `_index_single_repo()` for each
-- `index_repo(name)` → finds the named repo, calls `_index_single_repo()` with delete_existing=True
-- `_index_single_repo()` runs: file_tree → metadata (4-tuple: metadata, file_filter,
-  file_roles, file_purposes) → files → chunks (passes file_roles/file_purposes
-  through to chunker) → embeddings → store
-- Produces a summary report at the end showing ok/skipped/error counts
-
----
-
-### `query/router.py`
-**Purpose:** Classify each user question into one of five query types.
-**Owns:** One Gemini call per question. The classification logic and prompt.
-**Does not own:** Any search or answer generation.
-
-How it works:
-- Sends the question + active_repo hint to Gemini Flash with a detailed prompt
-- Gemini returns JSON: `{"type": "cross_repo_metadata"}` etc.
-- Falls back to `cross_repo_semantic` on failure
-
-Five types and when each is used:
-- `list_repos` → user wants to see/count repos
-- `cross_repo_metadata` → technology/language/deployment (answerable from metadata)
-- `cross_repo_semantic` → concept exists somewhere? (requires code, answer is find/not-find)
-- `cross_repo_comparative` → which repo is best at X? (requires fair ranking)
-- `repo_specific` → targets one named repo or active session repo
-
-The key distinction the router must make:
-- metadata vs semantic: can the answer come from stored metadata fields or does it need code?
-- semantic vs comparative: is the answer find/not-find or a ranking/comparison?
-
----
+`_build_bm25_index(texts)` builds a BM25Okapi index from a list of chunk texts
+using simple whitespace tokenization. Called fresh on every hybrid_search call —
+fast enough for <10k chunks, avoids stale index issues.
 
 ### `query/retriever.py`
-**Purpose:** Translate a classified question into actual search results.
-**Owns:** The four retrieval strategies. Query enrichment. Chunk deduplication.
-**Does not own:** Classification (router) or answer generation (engine).
+`retrieve_repo_specific()` now calls `hybrid_search()` instead of `similarity_search()`.
+Fetches `TOP_K_HYBRID_FETCH = 20` raw candidates (up from 10) before deduplication,
+because hybrid scoring changes rank ordering significantly versus pure cosine —
+more headroom ensures the deduplication pass always has 5 fresh chunks to return.
 
-How it works:
+`retrieve_cross_repo_semantic()` and `retrieve_cross_repo_comparative()` are
+unchanged — they use `similarity_search_per_repo()` and `similarity_search_aggregated()`
+respectively, which remain cosine-only.
 
-`retrieve_cross_repo_metadata()`:
-  Calls list_all_repos() — no vector search, no embeddings.
-  Returns all repo metadata summaries. Engine + Gemini do the filtering.
-
-`retrieve_cross_repo_semantic(question)`:
-  Embeds question → `similarity_search_per_repo()` — returns the single
-  best-scoring chunk per repo. Every repo gets exactly one representative
-  chunk so Gemini can assess all repos, not just those that dominated top-k.
-
-`retrieve_cross_repo_comparative(question)`:
-  Embeds question → `similarity_search_aggregated(candidate_k=50)`.
-  Groups top-50 chunks by repo, scores each repo as avg of its top-3
-  chunk scores, ranks repos, returns top-3 repos × top-3 chunks each.
-  Fair comparison regardless of repo size or chunk count.
-
-`retrieve_repo_specific(question, repo_name, history, seen_ids)`:
-  Enriches query with last 2 turns, embeds, filters to repo,
-  deduplicates, returns top-5 fresh chunks (TOP_K_REPO_SPECIFIC = 5,
-  fetches 10 raw and dedups down to 5). Relies on context-header-enriched
-  embeddings (Section 8a) rather than a separate keyword-matching layer —
-  an earlier keyword-to-file layer was tried and removed (see Section 8a
-  for why).
-
----
-
-### `query/engine.py`
-**Purpose:** The main orchestrator. The only module cli.py calls.
-**Owns:** Session lifecycle, context window management, prompt building, answer generation.
-**Does not own:** Classification (delegates to router), search (delegates to retriever).
-
-How it works per turn:
-  1. Call router to classify the question
-  2. Call the appropriate retriever function
-  3. Build a prompt from retrieved context + session history
-  4. Call Gemini to generate the answer
-  5. Update session history (repo_specific only)
-  6. Return (answer, updated_session)
-
-Session management:
-- Session is a plain Python dict, lives in memory in cli.py
-- Starts on first repo_specific question, resets on any cross-repo or list question
-- Repo name from the router is normalized case-insensitively against
-  `list_all_repos()` before session lookup — corrects follow-up questions where
-  Gemini returns slightly different casing (e.g. "Corplaw-AI" vs "CorpLaw-AI")
-- Context window: after 4 turns (8 history entries), older turns are summarized
-  into one paragraph by Gemini — prevents unbounded prompt growth
-- Summarization failure is non-fatal: placeholder used so session continues
-
-Five prompt builders — one per query type:
-- `_build_metadata_prompt()` — list_repos + cross_repo_metadata (full metadata per repo)
-- `_build_semantic_prompt()` — cross_repo_semantic (flat chunk list)
-- `_build_comparative_prompt()` — cross_repo_comparative (structured by repo with rank/score)
-- `_build_repo_specific_prompt()` — repo_specific (history + repo metadata + chunks)
-
----
-
-### `cli.py`
-**Purpose:** The user-facing interface. The entry point for running the tool.
-**Owns:** Command parsing, the chat loop, user output formatting.
-**Does not own:** Any query logic — delegates everything to engine.query().
-
-How it works:
-- Two subcommands: `index` (runs indexing pipeline) and `chat` (starts conversation)
-- Chat loop: read input → call engine.query(question, session) → print answer → repeat
-- Session is held in the `session` variable in the loop and passed back each turn
-- Built-in commands: `reset` (clears session), `scope` (shows active repo), `exit`/`quit`
-- `load_dotenv()` called before any imports that read env vars — import order matters
+The enriched query (question + last 2 turns) is passed as `query_text` to
+`hybrid_search()` — this means BM25 also benefits from conversation context,
+not just the cosine embedding component.
 
 ---
 
 ## 22. Implementation Notes
 
-Key decisions made during implementation that any contributor should know:
+### Why Hybrid Search was added (the lib/auth.ts problem)
+
+**The failure mode:** "how does authentication work in CorpLaw-AI" returned
+`app/chat/[sessionId]/page.tsx` and `app/api/chat/route.ts` instead of `lib/auth.ts`.
+
+**Root cause:** Pure cosine similarity has a ~44-63% benchmark accuracy ceiling.
+`lib/auth.ts` had the correct context header (`Role: authentication`) and the
+correct embedding, but session/chat files contained enough semantically adjacent
+vocabulary (`session`, `sessionId`, `fetchSession`) to outscore it in cosine space.
+The embedding model learned that session management and authentication co-occur,
+so those files ranked higher despite not being the auth source.
+
+**Why context headers alone weren't enough:** The header improves the embedding
+signal but cannot overcome a volume imbalance — CorpLaw-AI had 18 chunks of
+session/chat code vs 2 chunks of auth code. The session files dominated the
+cosine ranking by sheer presence in the vector neighborhood.
+
+**Why the old keyword-to-file layer was not revived:** An earlier iteration
+reserved 2 of 5 chunk slots for files whose *path* matched keyword hint strings.
+This was removed because path substring matching produced false positives
+(e.g. "session" in the auth keyword group matched `app/chat/[sessionId]/page.tsx`
+instead of `lib/auth.ts`) and it only handled black-and-white questions cleanly.
+
+**The hybrid search fix:** BM25 scores `lib/auth.ts` highly because "auth" appears
+literally in the filename and code — it's a lexical exact match. Cosine scores
+the session files highly semantically. RRF fuses both rankings:
+
+```
+RRF_score(chunk) = 1/(60 + cosine_rank) + 1/(60 + bm25_rank)
+```
+
+A chunk that ranks well on BOTH methods (like `lib/auth.ts` — good BM25 on "auth",
+decent cosine on authentication concept) scores higher than a chunk that only
+wins on one dimension (the session files — great cosine, poor BM25 on "auth").
+
+**Why RRF over weighted score combination:** Raw BM25 and cosine scores are on
+incompatible scales (BM25 is unbounded, cosine is -1 to 1). RRF normalizes by
+rank rather than raw score, making the fusion stable without needing to tune a
+λ weighting parameter.
+
+**Scope:** Hybrid search is applied only to `retrieve_repo_specific()` — the path
+where this failure mode occurs. Cross-repo functions use their own fairness
+mechanisms (per-repo best, aggregated scoring) that already address their
+respective failure modes.
 
 ### deeplake_store.py
-- REPLACED: old per-row loop (N network calls, O(N) time)
-- `_load_all()` loads all embeddings as numpy matrix in one call,
-  then `M @ query_vector` computes all N cosine scores in one matrix multiply
-- `similarity_search_per_repo()`: scores all chunks, keeps only the best-scoring
-  chunk per repo — guarantees every repo is represented in cross_repo_semantic results
-- `similarity_search_aggregated()`: scores all chunks, groups by repo, scores each
-  repo as avg of its top-3 chunk scores — fair ranking for cross_repo_comparative
-- `list_all_repos()` now surfaces all new metadata fields so the metadata prompt
-  gives Gemini the full picture
-- `get_or_create_dataset()` uses `deeplake.dataset(path, token=token)` (load-or-create
-  in one call), then checks `"embedding" not in ds.tensors` to create tensors if
-  missing — handles both brand-new datasets and broken shells from earlier crashes
-- `delete_repo_chunks()` does NOT use `ds.pop()` — it's broken in deeplake 3.x
-  (`OverflowError: can't convert negative int to unsigned` on datasets with
-  committed history). Instead: rewrite-in-place — load all chunks, filter out
-  target repo's rows, reset dataset via `deeplake.empty(path, overwrite=True)`,
-  recreate tensors, re-append kept rows. See Section 10.
-
-### query/router.py
-- Five types: added cross_repo_comparative alongside existing four
-- cross_repo_semantic = find/not-find ("do any repos have X?")
-- cross_repo_comparative = ranking ("which repo has the best X?")
-- Fallback is cross_repo_semantic on any classification failure
+- `hybrid_search()` is the new primary search function for repo-specific queries
+- `similarity_search()` retained for internal use by aggregated/per-repo functions
+- `_build_bm25_index()` uses `BM25Okapi` from `rank-bm25` package
+- BM25 index is built in-memory per query call — no persistence needed at this scale
+- All other store functions (store_chunks, delete_repo_chunks, list_all_repos) unchanged
 
 ### query/retriever.py
-- retrieve_cross_repo_semantic() now uses similarity_search_per_repo() instead of
-  global top-k — returns one chunk per repo, every repo covered, none crowded out
-- retrieve_cross_repo_comparative() uses similarity_search_aggregated() — fair scoring
-- TOP_K_CROSS_REPO_SEMANTIC constant removed — per-repo search doesn't use fixed k
-- retrieve_cross_repo_metadata() unchanged — no embedding, no vector search
-- retrieve_repo_specific(): TOP_K_REPO_SPECIFIC = 5 (raised from 4), single cosine
-  search, fetches 10 raw and dedups down to 5
-- An earlier keyword-to-file retrieval layer (reserved slots for path-matched
-  chunks) was implemented and then REMOVED — see Section 8a for why. Retrieval
-  is back to a single cosine search; the context-header approach at index time
-  (Section 8a) does the work that layer was trying to do, more robustly.
+- `retrieve_repo_specific()` now imports and calls `hybrid_search()`
+- `TOP_K_HYBRID_FETCH = 20` (was `TOP_K_REPO_SPECIFIC * 2 = 10`) — wider fetch
+  because hybrid reranking changes the order significantly
+- Enriched query string passed as both embedding input and BM25 query text
+- Cross-repo retrieval functions unchanged
 
-### query/engine.py
-- Five branches in query() — cross_repo_comparative added
-- _build_metadata_prompt() now formats all new metadata fields per repo line
-  (has_authentication, database_type, key_features, external_services, etc.)
-- _build_comparative_prompt() new — structures output by repo with rank and score
-- Session resets on all cross-repo and list questions
-- repo_specific branch normalizes repo name case-insensitively against
-  list_all_repos() before session lookup — fixes follow-up questions where
-  the router returns slightly different casing (e.g. "Corplaw-AI" vs "CorpLaw-AI")
-
-### github_client.py
-- get_indexable_files() accepts file_filter dict from metadata_generator
-- "readme" mode: path prefix/exact match + extension gate
-- "language_fallback" mode: extension-based with EXCLUDED_PATH_SEGMENTS
-- INDEXABLE_EXTENSIONS constant removed
-
-### metadata_generator.py
-- Returns (metadata, file_filter, file_roles, file_purposes) — a 4-tuple, not 2
-- Single Gemini call now extracts all fields including new structural ones,
-  plus per-file file_roles and file_purposes (only when files_to_index.found)
-- New fields: has_authentication, has_database, database_type, has_api, api_style,
-  has_frontend, frontend_framework, architecture_pattern, key_features,
-  external_services, has_tests
-- All new fields normalized defensively — wrong types → safe defaults, never crash
-- file_roles values validated against VALID_FILE_ROLES — anything else → "other"
-- files_to_index.found requires a dedicated curated-list section (heading like
-  "Essential Files", "Read these files") — a generic Project Structure tree alone
-  does NOT set found=true. If a README has both, only the curated section is used.
-- Language fallback covers 17 languages + broad default
-- .md always included via ALWAYS_INCLUDE_EXTENSIONS
-
-### Gemini SDK
-- All files use `google-genai` (new SDK: `from google import genai`)
-  NOT `google-generativeai` (deprecated as of mid-2025)
-- Auth is via Vertex AI service account, NOT an API key — see Section 4
-- Pattern: `client = genai.Client(vertexai=True, project=..., location=..., credentials=...)`
-  `client.models.generate_content(model="gemini-2.5-flash", contents=prompt)`
-  `client.models.embed_content(model=..., contents=text, config={"task_type": ...})`
-
-### chunker.py
-- 1 token ≈ 4 chars approximation — no tokenizer library needed
-- chunk_index is per-file not global
-- Accepts optional file_roles/file_purposes dicts; prepends a one-line context
-  header to each file's content before chunking (Section 8a)
-- _infer_role_from_path() provides filename/folder-based role fallback for
-  files not covered by README-extracted roles
-- Each chunk now carries a file_role field in its metadata
-
-### embedder.py
-- RETRIEVAL_DOCUMENT at index time, RETRIEVAL_QUERY at query time — mismatching degrades quality
-- 0.65s sleep per call stays under 100 req/min free tier
-
-### cli.py
-- load_dotenv() before any imports that read env vars
-- reset/scope commands make no API calls
+### Future embedding upgrade path
+The current Gemini `text-embedding-004` is a general-purpose model not optimized
+for code retrieval. Qodo-Embed-1-1.5B (CoIR score 68.53 vs OpenAI 65.17) is
+purpose-built for natural language → code retrieval and would improve the cosine
+component of hybrid search. Migration requires:
+1. New dataset path (v6) — embedding dimensions change from 768 to 1536
+2. Full re-index of all repos with Qodo embedder
+3. Update `embedder.py` to use SentenceTransformers instead of Gemini API
+4. BM25 component carries over unchanged — no re-indexing needed for that
 
 ---
 
 ## 23. Progress Tracker
 
 ```
-[x] gemini_client.py           — Vertex AI service account auth
-[x] github_client.py           — README-driven file filter, language fallback
-[x] metadata_generator.py      — rich metadata extraction: 11 structural fields +
-                                  file_filter + file_roles + file_purposes (4-tuple)
-[x] chunker.py                 — context headers (Role/Purpose), filename/folder
-                                  role inference fallback
+[x] gemini_client.py
+[x] github_client.py
+[x] metadata_generator.py
+[x] chunker.py                    — context headers (Role/Purpose)
 [x] embedder.py
-[x] deeplake_store.py          — batch search + per-repo search + aggregated scoring
-                                  + rewrite-in-place deletion (no ds.pop())
-[x] indexer/main.py            — passes file_filter, file_roles, file_purposes
-[x] query/router.py            — five types: list/metadata/semantic/comparative/repo_specific
-[x] query/retriever.py         — TOP_K_REPO_SPECIFIC=5, single cosine search
-                                  (keyword layer removed)
-[x] query/engine.py            — five branches, rich metadata prompt, fair repo
-                                  ranking, repo-name case normalization
+[x] deeplake_store.py             — hybrid_search() (BM25 + cosine + RRF)
+[x] indexer/main.py
+[x] query/router.py               — five query types
+[x] query/retriever.py            — retrieve_repo_specific uses hybrid_search
+[x] query/engine.py
 [x] cli.py
-[x] End-to-end test with real repo (CorpLaw-AI) — indexing + chat working
+[x] End-to-end test (CorpLaw-AI)  — indexing + chat working
+[x] Hybrid search implemented     — fixes lib/auth.ts retrieval failure
 [ ] Full index of all 21 repos
+[ ] Verify hybrid search on CorpLaw-AI auth question
+[ ] Future: Qodo-Embed-1-1.5B migration for better code-specific cosine
 ```
 
 ---
 
 *Last updated: 2026-06-15*
-*Status: All modules implemented and working end-to-end on CorpLaw-AI. Dataset:
-hub://ORG/github_brain_v5. Context-header-based retrieval (no keyword layer).
-Rewrite-in-place deletion avoids the deeplake 3.x ds.pop() bug. Next: full index
-of remaining repos.*
+*Status: Hybrid search (BM25 + cosine + RRF) implemented in deeplake_store.py and
+retriever.py. Fixes the pure-cosine failure mode where lib/auth.ts lost to
+session/chat files on "how does authentication work". Next: install rank-bm25,
+test the fix on CorpLaw-AI, then full index of remaining 21 repos.*

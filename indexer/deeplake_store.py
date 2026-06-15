@@ -19,13 +19,23 @@ HOW IT WORKS:
   against the query vector simultaneously. This is O(1) network calls
   regardless of dataset size, making it fast enough for free tier use.
 
-  The old approach loaded one embedding per network call in a loop —
-  O(N) network calls, unusably slow for anything beyond a handful of chunks.
-
 SEARCH MODES:
-  similarity_search(query_vector, repo_name=None)  → semantic search across all repos
-  similarity_search(query_vector, repo_name="X")   → semantic search within one repo
-  list_all_repos()                                  → return metadata summaries, no vectors
+  hybrid_search(query_vector, query_text, repo_name=None)  → BM25 + cosine via RRF (default)
+  similarity_search(query_vector, repo_name=None)          → cosine-only fallback
+  similarity_search_per_repo(query_vector)                 → best chunk per repo
+  similarity_search_aggregated(query_vector)               → repo-level scoring
+  list_all_repos()                                         → metadata summaries, no vectors
+
+WHY HYBRID SEARCH:
+  Pure cosine similarity has a hard accuracy ceiling (~44-63% on benchmarks).
+  The failure mode this project hit: "how does authentication work?" returned
+  chat/session files (semantically adjacent) instead of lib/auth.ts (the actual
+  auth file). BM25 fixes this — it scores lib/auth.ts highly because "auth"
+  appears literally in the filename and code. Combining both via Reciprocal Rank
+  Fusion (RRF) gives the best of lexical precision and semantic coverage.
+
+  RRF formula: score(chunk) = 1/(k + cosine_rank) + 1/(k + bm25_rank)
+  where k=60 is the standard RRF constant that dampens rank differences.
 
 WHY ONE DATASET FOR ALL REPOS:
   Keeping everything in one dataset (hub://ORG/github_brain_v5) lets us do
@@ -54,6 +64,7 @@ import os
 import json
 import numpy as np
 import deeplake
+from rank_bm25 import BM25Okapi
 from typing import Optional
 
 
@@ -292,7 +303,135 @@ def _load_all(repo_name: Optional[str] = None) -> tuple[np.ndarray, list[str], l
 
 
 # ---------------------------------------------------------------------------
-# Read: similarity search
+# Read: BM25 index builder (internal)
+# ---------------------------------------------------------------------------
+
+def _build_bm25_index(texts: list[str]) -> BM25Okapi:
+    """
+    Build a BM25 index from a list of chunk texts.
+
+    Tokenization is simple whitespace + lowercase split — sufficient for
+    code since identifiers, keywords, and filenames are space-separated
+    in the context headers and code content.
+
+    BM25Okapi is the standard Okapi BM25 variant: TF is saturated so very
+    frequent terms don't dominate, and IDF penalises terms that appear in
+    most chunks (common boilerplate).
+    """
+    tokenized = [text.lower().split() for text in texts]
+    return BM25Okapi(tokenized)
+
+
+# ---------------------------------------------------------------------------
+# Read: hybrid search (BM25 + cosine via RRF) — PRIMARY search function
+# ---------------------------------------------------------------------------
+
+def hybrid_search(
+    query_vector: list[float],
+    query_text: str,
+    top_k: int = 10,
+    repo_name: Optional[str] = None,
+) -> list[dict]:
+    """
+    Find the top-k chunks using Hybrid Search: BM25 + cosine similarity
+    fused via Reciprocal Rank Fusion (RRF).
+
+    WHY THIS OVER PURE COSINE:
+      Pure cosine similarity (~44-63% benchmark accuracy) misses cases where
+      the lexically correct file ranks lower than semantically adjacent files.
+      Example: "how does authentication work" returns chat/session files
+      (semantically close) instead of lib/auth.ts (lexically correct — "auth"
+      is literally in the filename and code).
+
+      BM25 fixes this by rewarding exact term overlap. Combining both via RRF
+      gives lexical precision AND semantic coverage simultaneously.
+
+    HOW RRF WORKS:
+      Rather than combining raw scores (which have incompatible scales),
+      RRF combines ranks:
+
+        RRF_score(chunk) = 1/(k + cosine_rank) + 1/(k + bm25_rank)
+
+      where k=60 is the standard constant that prevents top-ranked documents
+      from dominating too strongly. A chunk ranked #1 by both methods gets
+      the highest combined score. A chunk ranked #1 by cosine but #50 by BM25
+      still scores well but not as high as a consensus top result.
+
+    Parameters:
+        query_vector  768-dim float list from embedder.embed_query()
+        query_text    Raw query string — used for BM25 tokenization
+        top_k         Number of results to return
+        repo_name     If given, search only within this repo.
+                      If None, search across all repos.
+
+    Returns list of dicts sorted by RRF score descending:
+    [{"text": "...", "score": 0.031, "repo_name": "...", "file_path": "...", ...}]
+
+    Note: RRF scores are not cosine similarities — they're rank-fusion scores
+    (typically in range 0.01–0.04). Higher is still better.
+    """
+    embeddings, texts, metas = _load_all(repo_name=repo_name)
+
+    if len(embeddings) == 0:
+        print(f"  [deeplake] No chunks found"
+              + (f" for repo: {repo_name}" if repo_name else "") + ".")
+        return []
+
+    n = len(texts)
+
+    # --- Dense scores (cosine similarity) ---
+    query_np   = np.array(query_vector, dtype=np.float32)
+    query_norm = np.linalg.norm(query_np)
+    if query_norm == 0:
+        return []
+    query_np = query_np / query_norm
+
+    norms      = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms      = np.where(norms == 0, 1, norms)
+    normalized = embeddings / norms
+    dense_scores = normalized @ query_np   # shape (N,)
+
+    # --- Sparse scores (BM25) ---
+    bm25          = _build_bm25_index(texts)
+    sparse_scores = np.array(
+        bm25.get_scores(query_text.lower().split()),
+        dtype=np.float32,
+    )
+
+    # --- Reciprocal Rank Fusion ---
+    # argsort ascending then argsort again gives rank (0 = worst, N-1 = best)
+    # We want rank 0 = best, so invert: rank = (N-1) - rank_ascending
+    RRF_K = 60   # standard constant
+
+    dense_rank_asc  = np.argsort(np.argsort(dense_scores))   # 0 = worst
+    sparse_rank_asc = np.argsort(np.argsort(sparse_scores))  # 0 = worst
+
+    # Convert to descending rank (0 = best) for RRF formula
+    dense_rank  = (n - 1) - dense_rank_asc
+    sparse_rank = (n - 1) - sparse_rank_asc
+
+    rrf_scores = (
+        1.0 / (RRF_K + dense_rank) +
+        1.0 / (RRF_K + sparse_rank)
+    )
+
+    # Get top_k results
+    actual_k    = min(top_k, n)
+    top_indices = np.argsort(rrf_scores)[-actual_k:][::-1]
+
+    results = []
+    for idx in top_indices:
+        results.append({
+            "text":  texts[idx],
+            "score": float(rrf_scores[idx]),
+            **metas[idx],
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Read: cosine-only similarity search (kept as fallback / for aggregation)
 # ---------------------------------------------------------------------------
 
 def similarity_search(
@@ -302,6 +441,9 @@ def similarity_search(
 ) -> list[dict]:
     """
     Find the top-k chunks most semantically similar to a query vector.
+    Pure cosine similarity — used internally by aggregated search.
+
+    For the primary retrieval path, use hybrid_search() instead.
 
     HOW IT WORKS:
       1. Load all embeddings as a matrix M of shape (N, 768) — one network call
@@ -310,17 +452,13 @@ def similarity_search(
       4. argsort scores, take top_k indices
       5. Build result dicts from those indices
 
-    This replaces the old per-row loop which made N separate network calls.
-    For 1000 chunks: old = ~50 seconds, new = ~1-2 seconds.
-
     Parameters:
         query_vector  768-dim float list from embedder.embed_query()
         top_k         Max number of results to return
         repo_name     If given, search only within this repo.
                       If None, search across all repos.
 
-    Returns list of dicts sorted by similarity score descending:
-    [{"text": "...", "score": 0.91, "repo_name": "...", "file_path": "...", ...}]
+    Returns list of dicts sorted by similarity score descending.
     """
     embeddings, texts, metas = _load_all(repo_name=repo_name)
 
@@ -331,22 +469,17 @@ def similarity_search(
 
     query_np = np.array(query_vector, dtype=np.float32)
 
-    # Normalize query vector.
     query_norm = np.linalg.norm(query_np)
     if query_norm == 0:
         return []
     query_np = query_np / query_norm
 
-    # Normalize all embedding rows.
-    # norms shape: (N,) — one norm per row
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1, norms)   # avoid divide by zero
-    normalized = embeddings / norms           # shape: (N, 768)
+    norms = np.where(norms == 0, 1, norms)
+    normalized = embeddings / norms
 
-    # One matrix multiply → N cosine similarity scores.
-    scores = normalized @ query_np            # shape: (N,)
+    scores = normalized @ query_np   # shape: (N,)
 
-    # Get top_k indices (argsort ascending, take last top_k reversed).
     actual_k    = min(top_k, len(scores))
     top_indices = np.argsort(scores)[-actual_k:][::-1]
 
@@ -368,6 +501,8 @@ def similarity_search_per_repo(
 ) -> list[dict]:
     """
     Return the single best-matching chunk per repo for a given query.
+    Uses cosine similarity (not hybrid) since BM25 per-repo is expensive
+    and this function is used for cross-repo semantic coverage, not precision.
 
     WHY THIS EXISTS:
       Regular similarity_search(top_k=6) returns the 6 highest-scoring
@@ -377,21 +512,9 @@ def similarity_search_per_repo(
 
       This function guarantees every repo gets exactly one representative
       chunk — its highest-scoring one — so Gemini can make a complete
-      assessment across all repos, not just the ones that happened to
-      dominate the global top-k.
+      assessment across all repos.
 
-    HOW IT WORKS:
-      1. Score ALL chunks against the query (same batch matrix multiply)
-      2. For each repo, find the index of its highest-scoring chunk
-      3. Return those best-per-repo chunks sorted by score descending
-
-    Parameters:
-        query_vector  768-dim float list
-        max_repos     Cap on how many repos to return (default 10).
-                      In practice limited by how many repos are indexed.
-
-    Returns list of chunk dicts, one per repo, sorted by score descending:
-    [{"text": "...", "score": 0.91, "repo_name": "skillswap", ...}, ...]
+    Returns list of chunk dicts, one per repo, sorted by score descending.
     """
     embeddings, texts, metas = _load_all(repo_name=None)
 
@@ -410,14 +533,13 @@ def similarity_search_per_repo(
     scores     = normalized @ query_np   # shape (N,)
 
     # For each repo, find the index of its best-scoring chunk.
-    best: dict[str, tuple[int, float]] = {}   # repo_name → (index, score)
+    best: dict[str, tuple[int, float]] = {}
     for i, meta in enumerate(metas):
         repo = meta.get("repo_name", "unknown")
         s    = float(scores[i])
         if repo not in best or s > best[repo][1]:
             best[repo] = (i, s)
 
-    # Build result list sorted by score descending.
     results = []
     for repo, (idx, score) in sorted(best.items(), key=lambda x: -x[1][1]):
         results.append({
@@ -445,60 +567,18 @@ def similarity_search_aggregated(
 ) -> list[dict]:
     """
     Score repos as a whole rather than returning individual top-k chunks.
+    Uses cosine similarity internally (same as before) since the aggregation
+    logic already handles the fairness problem that hybrid search solves
+    at the chunk level.
 
     WHY THIS EXISTS:
-      Regular similarity_search returns the top-k chunks globally. For
-      comparative questions ("which repo has the best auth?") this is broken —
-      a repo with many auth-related chunks floods the top-k slots and crowds
-      out other repos entirely, even if those repos have equally good auth.
+      For comparative questions ("which repo has the best auth?"), global
+      top-k returns chunks from the repo with the most auth-related content,
+      crowding out other repos. This function scores each repo as the average
+      of its top-3 chunk scores and ranks repos by that aggregate score.
 
-      This function fixes that by aggregating chunk scores per repo first,
-      then ranking repos, then returning the best chunks from the top repos.
-
-    HOW IT WORKS:
-      1. Search broadly — fetch candidate_k chunks (default 50) globally
-      2. Group chunks by repo_name
-      3. For each repo, compute a repo_score = average of its top-3 chunk scores
-         (top-N average is more robust than max — penalises repos that only
-         have one fluke high-scoring chunk)
-      4. Rank repos by repo_score descending
-      5. For each of the top `top_repos` repos, take its best `chunks_per_repo`
-         chunks as the context to send to Gemini
-
-    WHY TOP-3 AVERAGE (not max, not all-chunk average):
-      - Max score: too easy to game — one flukey high-scoring chunk wins
-      - All-chunk average: penalises repos that have many chunks (larger repos
-        have more off-topic chunks pulling the average down)
-      - Top-3 average: fair across repo sizes, robust against flukes
-
-    Parameters:
-        query_vector      768-dim float list from embedder.embed_query()
-        top_repos         How many repos to return after ranking (default 3)
-        chunks_per_repo   How many chunks to include per top repo (default 3)
-        candidate_k       How many raw chunks to fetch before aggregating (default 50)
-                          Should be large enough to cover all repos meaningfully.
-                          Rule of thumb: candidate_k >= top_repos × avg_chunks_per_repo × 3
-
-    Returns:
-        List of repo result dicts, sorted by repo_score descending:
-        [
-          {
-            "repo_name":       "claimsense",
-            "repo_score":      0.89,          ← top-3 average chunk score
-            "repo_rank":       1,
-            "chunks":          [              ← best chunks_per_repo chunks
-              {"text": "...", "score": 0.91, "file_path": "...", ...},
-              {"text": "...", "score": 0.89, "file_path": "...", ...},
-              {"text": "...", "score": 0.87, "file_path": "...", ...},
-            ],
-            "repo_description": "...",        ← from metadata
-            "repo_technologies": [...],
-            "deployment_url":   "...",
-          },
-          ...
-        ]
+    Returns list of repo result dicts sorted by repo_score descending.
     """
-    # Step 1: Broad candidate search — no repo filter, high k.
     candidates = similarity_search(
         query_vector=query_vector,
         top_k=candidate_k,
@@ -508,32 +588,23 @@ def similarity_search_aggregated(
     if not candidates:
         return []
 
-    # Step 2: Group chunks by repo.
     repo_chunks: dict[str, list[dict]] = {}
     for chunk in candidates:
         name = chunk.get("repo_name", "unknown")
         repo_chunks.setdefault(name, []).append(chunk)
 
-    # Step 3: Score each repo using top-N average.
     TOP_N = 3
     repo_scores = []
     for name, chunks in repo_chunks.items():
-        # Chunks are already sorted descending by score from similarity_search.
         top_n_scores = [c["score"] for c in chunks[:TOP_N]]
         repo_score   = sum(top_n_scores) / len(top_n_scores)
         repo_scores.append((name, repo_score, chunks))
 
-    # Step 4: Rank repos by score descending.
     repo_scores.sort(key=lambda x: x[1], reverse=True)
 
-    # Step 5: Build result dicts for top_repos repos.
     results = []
     for rank, (name, score, chunks) in enumerate(repo_scores[:top_repos], start=1):
-        # Take best chunks_per_repo chunks for this repo.
         best_chunks = chunks[:chunks_per_repo]
-
-        # Pull repo-level metadata from the first chunk (all chunks from a repo
-        # carry identical repo-level metadata fields).
         first = chunks[0]
         result = {
             "repo_name":         name,
@@ -548,7 +619,6 @@ def similarity_search_aggregated(
         }
         results.append(result)
 
-    # Log the ranking.
     ranking_str = " | ".join(
         f"{r['repo_name']} ({r['repo_score']:.3f})" for r in results
     )
@@ -572,20 +642,7 @@ def list_all_repos() -> list[dict]:
 
     Does not load embeddings — only reads metadata, which is fast.
 
-    Returns list sorted by repo_name:
-    [
-      {
-        "repo_name":           "claimsense",
-        "repo_description":    "...",
-        "repo_technologies":   ["python", "flask", ...],
-        "repo_purpose":        "web app",
-        "repo_language":       "python",
-        "deployment_url":      "https://...",
-        "repo_topics":         [...],
-        "metadata_confidence": "high",
-      },
-      ...
-    ]
+    Returns list sorted by repo_name.
     """
     _, _, all_metas = _load_all(repo_name=None)
 
@@ -602,7 +659,6 @@ def list_all_repos() -> list[dict]:
                 "deployment_url":      meta.get("deployment_url"),
                 "repo_topics":         meta.get("repo_topics", []),
                 "metadata_confidence": meta.get("metadata_confidence"),
-                # Richer fields for metadata-based routing.
                 "has_authentication":   meta.get("has_authentication", False),
                 "has_database":         meta.get("has_database", False),
                 "database_type":        meta.get("database_type"),

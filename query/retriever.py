@@ -7,59 +7,55 @@ PURPOSE:
   (which executes the search). Owns query enrichment and deduplication.
 
 HOW IT WORKS:
-  Three search strategies, one per cross-repo type plus repo-specific:
+  Four retrieval strategies — one per query type:
 
   retrieve_cross_repo_metadata(question)
-    Does NOT do vector search. Instead it calls list_all_repos() to get
-    every repo's metadata summary, then returns that list to the engine.
-    The engine passes it to Gemini which filters and answers in natural language.
-    Fast — no embeddings involved.
-
-    WHY: Questions like "do I have anything using Redis?" are answered
-    deterministically by checking if "redis" appears in repo_technologies.
-    No need to search code chunks for this.
+    Does NOT do vector search. Calls list_all_repos() to get every repo's
+    metadata summary. The engine passes it to Gemini which filters and
+    answers in natural language. Fast — no embeddings involved.
 
   retrieve_cross_repo_semantic(question)
-    Embeds the question and runs similarity_search across ALL chunks with
-    no repo_name filter. Returns top-k chunks from whatever repos scored
-    highest. The engine feeds these to Gemini.
+    Embeds the question and runs similarity_search_per_repo() across ALL
+    chunks with no repo_name filter. Returns one best chunk per repo so
+    Gemini can assess every repo, not just those that dominated top-k.
 
-    WHY: Questions like "which repo implements rate limiting?" can't be
-    answered from metadata — the answer is in the code itself.
+  retrieve_cross_repo_comparative(question)
+    Embeds the question and runs similarity_search_aggregated() which scores
+    each repo as the average of its top-3 chunk scores — fair ranking
+    regardless of repo size or chunk count.
 
   retrieve_repo_specific(question, repo_name, conversation_history, seen_chunk_ids)
-    Embeds an ENRICHED query (question + last 2 conversation turns) and runs
-    cosine similarity search filtered to that repo only. Deduplicates against
-    chunks already seen in this session so the same code isn't repeated.
+    Uses HYBRID SEARCH (BM25 + cosine via RRF) on the enriched query,
+    filtered to the target repo. This is the primary search path and the
+    one that benefits most from hybrid retrieval.
 
-    WHY THIS WORKS NOW: Each chunk's text is prefixed (at index time, by
-    chunker.py) with a one-line context header — "File: lib/auth.ts | Role:
-    authentication | Purpose: ...". This means a chunk's embedding represents
-    not just its raw code but what the file DOES. A question like "how does
-    authentication work?" now scores highly against lib/auth.ts chunks directly,
-    because the embedded text itself says "Role: authentication". This removes
-    the need for a separate keyword-to-file matching layer — pure cosine
-    similarity surfaces the right files because the chunks carry their own
-    purpose in the embedded text.
+    WHY HYBRID HERE SPECIFICALLY:
+      This is where the pure cosine failure mode showed up — "how does
+      authentication work" returning session/chat files instead of lib/auth.ts.
+      BM25 catches exact term matches (e.g. "auth" in lib/auth.ts filename and
+      code), while cosine catches semantic intent. RRF fuses both rankings so
+      a file that's lexically AND semantically relevant rises to the top.
 
-    WHY ENRICHMENT: Follow-up questions like "how does that connect to the DB?"
-    have no meaning in isolation. Adding the prior exchange as context makes
-    the embedding capture the right semantic direction.
+    WHY ENRICHMENT:
+      Follow-up questions like "how does that connect to the DB?" have no
+      meaning in isolation. Adding prior exchange as context makes the
+      embedding capture the right semantic direction.
 
-    WHY DEDUPLICATION: Without it, the same highly-relevant chunk gets returned
-    every turn, wasting context space and making answers repetitive.
+    WHY DEDUPLICATION:
+      Without it, the same highly-relevant chunk gets returned every turn,
+      wasting context space and making answers repetitive.
 
 TOP-K VALUES:
-  cross_repo_semantic → k = 6  (wider net across all repos)
-  repo_specific       → k = 5  (focused, one repo)
-  The repo_specific search fetches k*2 then deduplicates down to k.
+  cross_repo_semantic → per-repo (one chunk per repo, up to 10 repos)
+  repo_specific       → 5 final chunks (fetches 20 raw via hybrid, deduplicates down to 5)
 """
 
 import hashlib
 from typing import Optional
 
 from indexer.embedder       import embed_query
-from indexer.deeplake_store import (similarity_search,
+from indexer.deeplake_store import (hybrid_search,
+                                    similarity_search,
                                     similarity_search_per_repo,
                                     similarity_search_aggregated,
                                     list_all_repos)
@@ -69,7 +65,10 @@ from indexer.deeplake_store import (similarity_search,
 # Constants
 # ---------------------------------------------------------------------------
 
-TOP_K_REPO_SPECIFIC = 5   # chunks per turn in a repo deep-dive session
+TOP_K_REPO_SPECIFIC      = 5    # final chunks returned per turn in a deep dive
+TOP_K_HYBRID_FETCH       = 20   # raw candidates fetched before deduplication
+                                 # wider than before (was 10) because hybrid
+                                 # scoring changes rank ordering significantly
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +89,10 @@ def _build_enriched_query(question: str, conversation_history: list[dict]) -> st
 
     Assistant answers are truncated at 300 chars to avoid bloating the
     query with verbose explanations.
+
+    NOTE: The enriched query is used for BOTH the cosine embedding AND the
+    BM25 tokenization in hybrid_search. This is intentional — enrichment
+    adds context words that help BM25 find relevant follow-up chunks too.
     """
     if not conversation_history:
         return question
@@ -134,11 +137,6 @@ def retrieve_cross_repo_metadata() -> list[dict]:
     No embedding, no vector search. Just reads the metadata that was
     generated at index time and stored on every chunk.
 
-    The engine receives this list and passes it to Gemini along with the
-    question. Gemini does the filtering (e.g. "which ones use Redis?")
-    in its response rather than us doing it programmatically — this is
-    more flexible because Gemini can handle fuzzy matches, synonyms, etc.
-
     Returns list of repo summary dicts (see list_all_repos() in deeplake_store).
     """
     print("  [retriever] Cross-repo metadata lookup (no vector search)")
@@ -150,39 +148,10 @@ def retrieve_cross_repo_metadata() -> list[dict]:
 def retrieve_cross_repo_comparative(question: str) -> list[dict]:
     """
     Rank repos fairly for comparative questions like "which has the best auth?".
-    Used for cross_repo_comparative questions.
+    Uses cosine-only aggregated search (similarity_search_aggregated) since
+    the aggregation logic already handles the fairness problem at the repo level.
 
-    WHY NOT regular similarity_search:
-      Global top-k returns the highest-scoring chunks regardless of repo.
-      A repo with many auth-related chunks floods the top-k and crowds out
-      other repos even if those repos have equally good auth implementations.
-      The answer ends up biased towards whichever repo has the most chunks
-      on the topic, not whichever actually has the best implementation.
-
-    HOW AGGREGATED SEARCH FIXES THIS:
-      1. Fetch top-50 chunks globally (candidate pool)
-      2. Group chunks by repo_name
-      3. For each repo: repo_score = average of its top-3 chunk scores
-         (top-3 average is fair across repo sizes — not skewed by repo having
-         many chunks or only one fluke high-scoring chunk)
-      4. Rank repos by repo_score
-      5. Return the top-3 repos, each with their best 3 chunks
-
-      Now Gemini receives a fair representation of each repo's relevant code
-      and can make a genuine comparison.
-
-    Returns list of repo result dicts from similarity_search_aggregated():
-    [
-      {
-        "repo_name":   "claimsense",
-        "repo_score":  0.89,
-        "repo_rank":   1,
-        "chunks":      [{"text": "...", "score": 0.91, ...}, ...],
-        "repo_description": "...",
-        ...
-      },
-      ...
-    ]
+    Returns list of repo result dicts from similarity_search_aggregated().
     """
     q = question[:80] + "..." if len(question) > 80 else question
     print(f"  [retriever] Cross-repo comparative search: '{q}'")
@@ -206,25 +175,8 @@ def retrieve_cross_repo_comparative(question: str) -> list[dict]:
 def retrieve_cross_repo_semantic(question: str) -> list[dict]:
     """
     Find the best matching chunk per repo for a semantic question.
-    Used for cross_repo_semantic questions.
-
-    WHY PER-REPO INSTEAD OF GLOBAL TOP-K:
-      The old approach: similarity_search(top_k=6) returns the 6 highest-
-      scoring chunks globally. For "do any repos implement rate limiting?",
-      those 6 might all be from 1-2 repos with many relevant chunks,
-      completely missing other repos that also have rate limiting but
-      scored 7th or 8th overall.
-
-      The new approach: similarity_search_per_repo() returns the single
-      best chunk from EVERY repo. Gemini now sees a representative sample
-      from all repos and can answer "skillswap, claimsense, and car-rental
-      all implement it — corplaw does not" instead of missing repos entirely.
-
-    HOW IT WORKS:
-      1. Score all chunks against the query (same batch matrix multiply)
-      2. For each repo, find its single highest-scoring chunk
-      3. Return all repos sorted by their best score descending
-      4. Gemini reads one chunk per repo and determines which ones are relevant
+    Uses cosine-only per-repo search (similarity_search_per_repo) since
+    the goal here is coverage across repos, not precision within one repo.
 
     Returns list of chunk dicts, one per repo, sorted by score descending.
     """
@@ -252,37 +204,46 @@ def retrieve_repo_specific(
     seen_chunk_ids: set,
 ) -> list[dict]:
     """
-    Semantic search within a single repo, with enrichment and deduplication.
-    Used for repo_specific questions (deep dives).
+    Hybrid search (BM25 + cosine via RRF) within a single repo,
+    with query enrichment and deduplication.
+
+    This is the primary retrieval path and the one most improved by
+    hybrid search. Pure cosine was missing lexically correct files
+    (e.g. lib/auth.ts for "how does authentication work") because
+    semantically adjacent files (session/chat code) ranked higher.
+    BM25 catches the exact term match; RRF fuses both rankings.
 
     Parameters:
         question               Current user question.
         repo_name              Which repo to search within.
         conversation_history   Full session history for query enrichment.
-        seen_chunk_ids         Chunks already used this session (mutated in place —
-                               new chunk IDs are added to this set by this function).
+        seen_chunk_ids         Chunks already used this session (mutated
+                               in place — new IDs added by this function).
 
     Process:
       1. Enrich the query with recent conversation context
-      2. Embed the enriched query
-      3. Search Deep Lake filtered to repo_name
+      2. Embed the enriched query (for cosine component)
+      3. Run hybrid_search (BM25 + cosine + RRF) filtered to repo_name
       4. Filter out chunks already seen this session
       5. Return up to TOP_K_REPO_SPECIFIC fresh chunks
 
-    Returns fresh chunk dicts sorted by similarity score descending.
+    Returns fresh chunk dicts sorted by RRF score descending.
     """
-    enriched     = _build_enriched_query(question, conversation_history)
-    print(f"  [retriever] Repo-specific search in '{repo_name}'")
+    enriched = _build_enriched_query(question, conversation_history)
+    print(f"  [retriever] Repo-specific hybrid search in '{repo_name}'")
 
     query_vector = embed_query(enriched)
     if query_vector is None:
         print("  [retriever] Failed to embed query.")
         return []
 
-    # Fetch double so we have headroom after deduplication.
-    raw = similarity_search(
+    # Hybrid search: BM25 + cosine via RRF
+    # Fetch TOP_K_HYBRID_FETCH candidates before deduplication to ensure
+    # we have enough headroom after filtering already-seen chunks.
+    raw = hybrid_search(
         query_vector=query_vector,
-        top_k=TOP_K_REPO_SPECIFIC * 2,
+        query_text=enriched,
+        top_k=TOP_K_HYBRID_FETCH,
         repo_name=repo_name,
     )
 
