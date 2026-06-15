@@ -6,3 +6,12 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 fastapi>=0.111.0
 uvicorn>=0.29.0
+
+# FIX 8: BM25 hybrid search and cross-encoder re-ranking
+# rank-bm25: BM25Okapi used in deeplake_store.hybrid_search()
+# sentence-transformers: CrossEncoder used in retriever._rerank()
+#   Note: sentence-transformers pulls in torch (~500MB on first install).
+#   The cross-encoder model (cross-encoder/ms-marco-MiniLM-L-6-v2, ~22MB)
+#   is downloaded automatically on first use and cached locally.
+rank-bm25>=0.2.2
+sentence-transformers>=2.7.0

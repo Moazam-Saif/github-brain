@@ -7,45 +7,68 @@ PURPOSE:
   session management, and Gemini answer generation into one clean flow.
 
 HOW IT WORKS (one turn):
-  1. Router classifies the question into one of four types
+  1. Router classifies the question into one of five types
   2. The appropriate retriever fetches context (metadata or code chunks)
   3. A prompt is built from that context + session history
   4. Gemini generates the answer
   5. The answer is returned to cli.py alongside the updated session
 
-FOUR QUESTION TYPES:
+FIVE QUESTION TYPES:
   list_repos           → metadata from list_all_repos() → Gemini answers
   cross_repo_metadata  → metadata from list_all_repos() → Gemini filters + answers
   cross_repo_semantic  → code chunks from all repos → Gemini answers
+  cross_repo_comparative → ranked repo chunks → Gemini compares
   repo_specific        → code chunks from one repo + session history → Gemini answers
+
+FIX 2 — CACHED list_all_repos():
+  The original code called list_all_repos() inside the repo_specific branch
+  on EVERY turn for repo name normalization. list_all_repos() calls _load_all()
+  which pulls the entire dataset from Deep Lake. Combined with the _load_all()
+  call inside hybrid_search(), that was TWO full dataset loads per turn.
+
+  Fix: list_all_repos() is called ONCE at the start of query() and its result
+  is stored as session["all_repos_cache"]. On subsequent turns in the same
+  session, the cache is reused. The cache is invalidated (refreshed) when a
+  session resets (new repo or cross-repo question), which is the only time
+  the repo list could meaningfully change mid-conversation.
+
+  For cross-repo questions (metadata, semantic, comparative) the cache is
+  populated fresh at the start of that turn and not stored — those paths
+  already called list_all_repos() exactly once and are unchanged.
+
+FIX 6 — CASING GUARD WITH EXPLICIT LOG:
+  The repo name normalization (case-insensitive match against indexed repos)
+  was already in the right position before the session continuation check.
+  However, when list_all_repos() returned empty (e.g. Deep Lake load failure),
+  matched_repo fell through to None, and the session was created with a
+  barebones {repo_name: repo_name} metadata dict. Every subsequent turn then
+  showed "stack: unknown, deployed: not deployed" in the prompt, silently
+  producing degraded answers.
+
+  Fix: explicit guard — if list_all_repos() returns empty or the repo name
+  doesn't match any indexed repo, log a clear warning and return an
+  informative message to the user rather than creating a broken session.
+
+FIX 7 — SESSION USES DEQUE FOR seen_chunk_ids:
+  seen_chunk_ids is now a collections.deque(maxlen=40) instead of a plain set.
+  Created via retriever.make_seen_chunk_ids() so the maxlen constant is owned
+  by retriever.py where the deduplication logic lives.
+
+  The deque is stored in session["seen_chunk_ids"] and passed directly to
+  retrieve_repo_specific(), which uses .append() instead of .add() and
+  membership-tests with `in` (works identically for deque as for set).
 
 SESSION MANAGEMENT (repo_specific only):
   A session is a dict that persists in memory across turns in cli.py.
-  It holds: active_repo, conversation_history, seen_chunk_ids, repo_metadata,
-  and a summarized_history for older turns.
+  It holds: active_repo, conversation_history, seen_chunk_ids (deque),
+  repo_metadata, summarized_history, and all_repos_cache.
 
   Sessions start when a repo_specific question is first asked.
   Sessions continue as long as questions stay within the same repo.
   Sessions reset when the user asks a cross-repo or list question,
   or explicitly types "reset" in the CLI.
-
-  Why: Without session state, every follow-up question is answered in
-  isolation. With it, "how does that connect to the DB?" knows what
-  "that" refers to because the prior exchange is included in context.
-
-CONTEXT WINDOW MANAGEMENT:
-  conversation_history grows with every turn. After MAX_VERBATIM_TURNS (4),
-  older turns are summarized into a paragraph by Gemini rather than kept
-  verbatim. This prevents the prompt from growing unboundedly while
-  preserving conversational continuity.
-
-RATE LIMITING:
-  Each query turn uses 2 Gemini calls: router + answer generation.
-  With sleep(4) after each generate_content call, we stay under
-  15 requests/minute on the free tier.
 """
 
-import json
 import time
 from typing import Optional
 from gemini_client import get_client, GEMINI_MODEL
@@ -54,7 +77,8 @@ from query.router    import classify_question
 from query.retriever import (retrieve_cross_repo_metadata,
                              retrieve_cross_repo_semantic,
                              retrieve_cross_repo_comparative,
-                             retrieve_repo_specific)
+                             retrieve_repo_specific,
+                             make_seen_chunk_ids)
 from indexer.deeplake_store import list_all_repos
 
 
@@ -65,14 +89,21 @@ from indexer.deeplake_store import list_all_repos
 MAX_VERBATIM_TURNS = 4
 
 
-def _new_session(repo_name: str, repo_metadata: dict) -> dict:
-    """Create a fresh session for a repo deep dive."""
+def _new_session(repo_name: str, repo_metadata: dict, all_repos_cache: list) -> dict:
+    """
+    Create a fresh session for a repo deep dive.
+
+    FIX 7: seen_chunk_ids is now a deque(maxlen=40) via make_seen_chunk_ids().
+    FIX 2: all_repos_cache stores the result of list_all_repos() so it isn't
+           re-fetched on every subsequent turn in this session.
+    """
     return {
         "active_repo":          repo_name,
         "conversation_history": [],
-        "seen_chunk_ids":       set(),
+        "seen_chunk_ids":       make_seen_chunk_ids(),   # FIX 7: deque, not set
         "repo_metadata":        repo_metadata,
         "summarized_history":   None,
+        "all_repos_cache":      all_repos_cache,         # FIX 2: cached repo list
     }
 
 
@@ -92,9 +123,9 @@ def _manage_context_window(session: dict, client) -> dict:
     if len(history) <= MAX_VERBATIM_TURNS * 2:
         return session
 
-    split         = len(history) - (MAX_VERBATIM_TURNS * 2)
-    old_turns     = history[:split]
-    recent_turns  = history[split:]
+    split        = len(history) - (MAX_VERBATIM_TURNS * 2)
+    old_turns    = history[:split]
+    recent_turns = history[split:]
 
     old_text = "\n".join(
         f"{t['role'].capitalize()}: {t['content']}" for t in old_turns
@@ -121,7 +152,6 @@ def _manage_context_window(session: dict, client) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
 
@@ -129,9 +159,9 @@ def _build_metadata_prompt(question: str, repos: list[dict]) -> str:
     """
     Prompt for both list_repos and cross_repo_metadata questions.
 
-    Passes every repo's full metadata to Gemini including the new richer
-    fields (has_authentication, has_database, key_features, etc.) so it
-    can answer questions like "which repos have auth?" without touching chunks.
+    Passes every repo's full metadata to Gemini including the richer
+    structural fields so it can answer questions like "which repos have auth?"
+    without touching code chunks.
     """
     lines = []
     for r in repos:
@@ -159,7 +189,6 @@ def _build_metadata_prompt(question: str, repos: list[dict]) -> str:
         if r.get("key_features"):
             parts.append(f"features: {', '.join(r['key_features'][:4])}")
 
-        # Boolean flags as a compact summary.
         flags = []
         if r.get("has_authentication"): flags.append("auth")
         if r.get("has_database"):       flags.append("database")
@@ -186,13 +215,7 @@ Repository metadata:
 
 
 def _build_semantic_prompt(question: str, chunks: list[dict]) -> str:
-    """
-    Prompt for cross_repo_semantic questions.
-
-    Gives Gemini retrieved code chunks from across repos. Each chunk
-    is labelled with its repo name and file path so Gemini can reference
-    them precisely in the answer.
-    """
+    """Prompt for cross_repo_semantic questions."""
     chunks_text = "\n\n---\n\n".join(
         f"Repo: {c.get('repo_name')} | File: {c.get('file_path')}\n"
         f"Similarity score: {c.get('score', 0):.2f}\n\n{c.get('text', '')}"
@@ -212,21 +235,7 @@ Retrieved code context:
 
 
 def _build_comparative_prompt(question: str, ranked_repos: list[dict]) -> str:
-    """
-    Prompt for cross_repo_comparative questions.
-
-    Unlike the semantic prompt which gives Gemini a flat list of chunks,
-    this prompt is structured around repos. Each repo gets a section with:
-      - Its rank and aggregate score (so Gemini knows the ordering)
-      - Its metadata (description, stack)
-      - Its best matching code chunks
-
-    This structure tells Gemini: "here are the top repos ranked by
-    relevance to this topic — now make a qualitative comparison."
-
-    The score is shown explicitly so Gemini can factor in how closely
-    each repo matched the topic, not just answer based on code quality alone.
-    """
+    """Prompt for cross_repo_comparative questions."""
     sections = []
     for repo in ranked_repos:
         chunks_text = "\n\n".join(
@@ -276,9 +285,6 @@ def _build_repo_specific_prompt(
       1. Repo metadata summary — reminds Gemini what this repo is
       2. Conversation history — prior turns so follow-ups make sense
       3. Retrieved chunks — the actual code relevant to this question
-
-    The summarized_history field replaces older verbatim turns once
-    the context window management has compressed them.
     """
     meta     = session["repo_metadata"]
     techs    = ", ".join(meta.get("repo_technologies", [])) or "unknown"
@@ -298,14 +304,14 @@ def _build_repo_specific_prompt(
             f"[Summary of earlier conversation]\n{session['summarized_history']}"
         )
     for turn in session["conversation_history"]:
-        history_parts.append(
-            f"{turn['role'].capitalize()}: {turn['content']}"
-        )
+        history_parts.append(f"{turn['role'].capitalize()}: {turn['content']}")
     history_str = "\n\n".join(history_parts) if history_parts else "None"
 
+    # Show re-rank score if available, otherwise fall back to cosine score.
     chunks_text = "\n\n---\n\n".join(
         f"File: {c.get('file_path')} (chunk {c.get('chunk_index')})\n"
-        f"Similarity: {c.get('score', 0):.2f}\n\n{c.get('text', '')}"
+        f"Relevance: {c.get('rerank_score', c.get('score', 0)):.2f}\n\n"
+        f"{c.get('text', '')}"
         for c in chunks
     )
 
@@ -372,25 +378,23 @@ def query(
 
     Parameters:
         question  The user's natural language question.
-        session   Current session dict or None. For repo_specific questions,
-                  pass the returned session back on the next call to preserve
-                  conversation history, seen chunks, and active repo context.
+        session   Current session dict or None.
 
     Returns:
         (answer_str, updated_session)
 
-        updated_session is None for list_repos, cross_repo_metadata, and
-        cross_repo_semantic — these don't maintain session state.
+    FIX 2 — list_all_repos() caching:
+      list_all_repos() is called once per query() invocation and its result
+      is used for:
+        (a) repo name normalization in the repo_specific branch
+        (b) building the metadata prompt for list_repos / cross_repo_metadata
+      For repo_specific turns after the first, the result is stored in
+      session["all_repos_cache"] and reused — no second Deep Lake load.
 
-        updated_session is the mutated session dict for repo_specific queries.
-        Pass it back on the next call to continue the conversation.
-
-    Full flow per call:
-        router → classify question type
-        retriever → fetch appropriate context
-        prompt builder → assemble Gemini prompt
-        Gemini → generate answer
-        session update → append turn to history (repo_specific only)
+    FIX 6 — casing guard:
+      If list_all_repos() returns empty or the repo name can't be matched,
+      we log a warning and return an informative error rather than silently
+      creating a broken session with empty metadata.
     """
     client      = get_client()
     active_repo = session["active_repo"] if session else None
@@ -401,16 +405,16 @@ def query(
     print(f"[engine] Routed as: {route}")
 
     # -----------------------------------------------------------------------
-    # list_repos — show all repos from metadata
+    # list_repos
     # -----------------------------------------------------------------------
     if query_type == "list_repos":
         repos  = list_all_repos()
         prompt = _build_metadata_prompt(question, repos)
         answer = _generate_answer(prompt, client)
-        return answer, None   # resets session
+        return answer, None
 
     # -----------------------------------------------------------------------
-    # cross_repo_metadata — answer from stored metadata, no vector search
+    # cross_repo_metadata
     # -----------------------------------------------------------------------
     if query_type == "cross_repo_metadata":
         repos = retrieve_cross_repo_metadata()
@@ -422,10 +426,10 @@ def query(
             )
         prompt = _build_metadata_prompt(question, repos)
         answer = _generate_answer(prompt, client)
-        return answer, None   # resets session
+        return answer, None
 
     # -----------------------------------------------------------------------
-    # cross_repo_semantic — semantic search across all code chunks
+    # cross_repo_semantic
     # -----------------------------------------------------------------------
     if query_type == "cross_repo_semantic":
         chunks = retrieve_cross_repo_semantic(question)
@@ -438,10 +442,10 @@ def query(
             )
         prompt = _build_semantic_prompt(question, chunks)
         answer = _generate_answer(prompt, client)
-        return answer, None   # resets session
+        return answer, None
 
     # -----------------------------------------------------------------------
-    # cross_repo_comparative — rank repos fairly, then compare
+    # cross_repo_comparative
     # -----------------------------------------------------------------------
     if query_type == "cross_repo_comparative":
         ranked_repos = retrieve_cross_repo_comparative(question)
@@ -454,26 +458,58 @@ def query(
             )
         prompt = _build_comparative_prompt(question, ranked_repos)
         answer = _generate_answer(prompt, client)
-        return answer, None   # resets session
+        return answer, None
 
     # -----------------------------------------------------------------------
     # repo_specific — deep dive with session management
     # -----------------------------------------------------------------------
-    repo_name = route["repo"]
+    repo_name = route.get("repo", "")
 
-# Normalize repo name casing against what's actually indexed.
-    all_repos = list_all_repos()
+    # FIX 2: Use cached repo list from session if available, otherwise fetch once.
+    # This avoids a second _load_all() call on top of the one inside hybrid_search.
+    if session and session.get("all_repos_cache"):
+        all_repos = session["all_repos_cache"]
+        print(f"[engine] Using cached repo list ({len(all_repos)} repos)")
+    else:
+        all_repos = list_all_repos()
+        print(f"[engine] Fetched repo list ({len(all_repos)} repos)")
+
+    # FIX 6: Guard against empty repo list — log clearly and return informative error.
+    if not all_repos:
+        return (
+            "I couldn't load the indexed repo list from Deep Lake. "
+            "Check your ACTIVELOOP_TOKEN and ACTIVELOOP_ORG, then try again.",
+            session,
+        )
+
+    # FIX 6: Case-insensitive normalization — BEFORE the session continuation check.
+    # If the router returns "corplaw-ai" but the dataset has "CorpLaw-AI",
+    # normalize to the exact indexed casing NOW so session["active_repo"] comparisons
+    # work correctly. Log a warning if normalization changed the name.
     matched_repo = next(
         (r for r in all_repos if r["repo_name"].lower() == repo_name.lower()),
         None,
     )
-    if matched_repo:
-        repo_name = matched_repo["repo_name"]  # use the exact casing from the dataset
+
+    if matched_repo is None:
+        # FIX 6: Explicit warning — don't silently create a broken session.
+        print(f"[engine] WARNING: repo '{repo_name}' from router not found in "
+              f"indexed repos. Available: {[r['repo_name'] for r in all_repos]}")
+        return (
+            f"I couldn't find a repo named '{repo_name}' in your indexed repos. "
+            f"Try asking about one of your indexed repos by its exact name, or "
+            f"run `python cli.py index --mode full` if you haven't indexed yet.",
+            None,
+        )
+
+    if matched_repo["repo_name"] != repo_name:
+        print(f"[engine] Normalized repo name: '{repo_name}' → '{matched_repo['repo_name']}'")
+    repo_name = matched_repo["repo_name"]
 
     # Start new session or continue existing one.
+    # Normalization above guarantees repo_name casing matches session["active_repo"].
     if session is None or session.get("active_repo") != repo_name:
-        repo_meta = matched_repo or {"repo_name": repo_name}
-        session = _new_session(repo_name, repo_meta)
+        session = _new_session(repo_name, matched_repo, all_repos)
         print(f"[engine] New session: {repo_name}")
     else:
         print(f"[engine] Continuing session: {repo_name}")
@@ -481,7 +517,8 @@ def query(
     # Compress old history if needed.
     session = _manage_context_window(session, client)
 
-    # Retrieve relevant chunks.
+    # Retrieve relevant chunks via hybrid search + re-rank.
+    # seen_chunk_ids is the capped deque from the session (FIX 7).
     chunks = retrieve_repo_specific(
         question=question,
         repo_name=repo_name,

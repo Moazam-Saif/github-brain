@@ -4,7 +4,7 @@ chunker.py
 Splits file content into overlapping chunks for embedding and storage.
 
 Responsibilities:
-  - Prepend a context header to each file's content before chunking
+  - Prepend context headers to every chunk (FIX 5 — not just chunk 0)
   - Split file text into chunks of ~512 tokens
   - Overlap consecutive chunks by ~50 tokens to avoid context loss at boundaries
   - Attach full repo metadata + file-level fields to each chunk
@@ -21,26 +21,35 @@ Token estimation:
   loading a full tokenizer. This keeps dependencies minimal and is accurate
   enough for chunking purposes — the goal is approximately 512 tokens, not exactly.
 
-CONTEXT HEADERS (new):
-  Before chunking, each file's content is prefixed with a one-line header:
+CONTEXT HEADERS (FIX 5 — header on EVERY chunk, not just chunk 0):
+  Before chunking, each file's content is prefixed with a full context header:
 
     File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup and NextAuth adapter configuration
 
-  This makes every chunk's embedding semantically represent what the file DOES,
-  not just its raw code. A question like "how does authentication work?" now
-  scores highly against lib/auth.ts chunks directly — not just against files
-  that happen to talk *about* auth in passing.
+  This was the original behaviour — but the header only appeared in chunk 0,
+  because it was prepended to the file content before the sliding window ran.
+  Chunk 1, 2, 3, ... started wherever the window landed in the raw code with
+  NO role/file context in their embedded text.
 
-  Role and purpose come from one of two sources, in priority order:
-    1. README-extracted (file_roles / file_purposes from metadata_generator.py) —
-       only available for files in the README's curated "important files" list.
-    2. Filename/folder inference (_infer_role_from_path) — a lightweight fallback
-       based on the file's own name and immediate parent folder. Used for all
-       other files, including repos with no curated README list at all.
+  FIX 5: A SHORT header is now prepended to EVERY chunk:
+    Chunk 0 (first):     full header — "File: lib/auth.ts | Role: authentication | Purpose: ..."
+    Chunk 1+ (rest):     short header — "File: lib/auth.ts | Role: authentication"
+                         (no Purpose — that's only needed once per file)
 
-  If no role can be determined, the header omits the Role/Purpose fields and
-  is just "File: <path>". A header is always present so every chunk at least
-  carries its file path in the embedded text.
+  This ensures BM25 and cosine BOTH get role/file-path signal for ANY chunk
+  that the retriever surfaces — not just the first one. A question like
+  "how does auth connect to the database?" might find its answer in chunk 3
+  of lib/auth.ts (the Prisma adapter methods). Previously chunk 3 had no
+  role header; now it has "File: lib/auth.ts | Role: authentication" in its
+  embedded text, so it correctly surfaces for auth-related questions.
+
+  The short header adds ~15-20 tokens per chunk — negligible versus 512 token
+  chunk size, and well worth the improvement in retrieval accuracy.
+
+Role/purpose resolution order (unchanged from original):
+  1. README-extracted (file_roles / file_purposes from metadata_generator.py)
+  2. Filename/folder inference (_infer_role_from_path)
+  3. Neither available — short header is just "File: <path>"
 """
 
 from datetime import datetime, timezone
@@ -62,14 +71,6 @@ OVERLAP_CHARS        = OVERLAP_TOKENS   * CHARS_PER_TOKEN     # 200 chars
 # ---------------------------------------------------------------------------
 # Filename/folder-based role inference (fallback when README has no role)
 # ---------------------------------------------------------------------------
-#
-# Checked in this order for every file NOT covered by README-extracted file_roles:
-#   1. Filename match (FILENAME_ROLE_MAP)   — most specific
-#   2. Folder match   (FOLDER_ROLE_MAP)     — less specific, broader net
-#   3. No match → role is None, header omits Role/Purpose
-#
-# Roles here use the SAME controlled vocabulary as metadata_generator.py's
-# VALID_FILE_ROLES, so headers look identical regardless of source.
 
 FILENAME_ROLE_MAP = [
     (["auth", "login", "logout", "oauth", "jwt", "credential", "password", "signup", "register"], "authentication"),
@@ -123,39 +124,27 @@ def _infer_role_from_path(file_path: str) -> Optional[str]:
     and immediate parent folder, when no README-extracted role is available.
 
     Matching order:
-      1. Filename (without extension) checked against FILENAME_ROLE_MAP —
-         e.g. "authController.js" → filename "authcontroller" contains "auth"
-         → "authentication"
-      2. Parent folder name checked against FOLDER_ROLE_MAP —
-         e.g. "server/models/User.js" → folder "models" → "database"
+      1. Filename (without extension) checked against FILENAME_ROLE_MAP
+      2. Parent folder name checked against FOLDER_ROLE_MAP
       3. No match → None
 
-    Both maps are checked using case-insensitive substring matching against
-    the filename/foldername, so "AuthController.java" and "auth_controller.py"
-    both match "auth".
-
-    Returns the role string, or None if no rule matches.
+    Both maps use case-insensitive substring matching.
     """
-    path = file_path.replace("\\", "/")
+    path  = file_path.replace("\\", "/")
     parts = path.split("/")
     filename = parts[-1].lower()
-
-    # Strip extension for filename matching.
     filename_no_ext = filename.rsplit(".", 1)[0] if "." in filename else filename
 
-    # 1. Filename match — most specific.
     for keywords, role in FILENAME_ROLE_MAP:
         if any(kw in filename_no_ext for kw in keywords):
             return role
 
-    # 2. Parent folder match — broader net.
     if len(parts) >= 2:
         parent_folder = parts[-2].lower()
         for keywords, role in FOLDER_ROLE_MAP:
             if any(kw in parent_folder for kw in keywords):
                 return role
 
-    # 3. No match.
     return None
 
 
@@ -163,37 +152,31 @@ def _infer_role_from_path(file_path: str) -> Optional[str]:
 # Context header construction
 # ---------------------------------------------------------------------------
 
-def _build_chunk_header(
+def _build_full_header(
     file_path: str,
     file_roles: dict,
     file_purposes: dict,
-) -> str:
+) -> tuple[str, Optional[str]]:
     """
-    Build the one-line context header prepended to a file's content
-    before chunking.
+    Build the full context header for chunk 0 and resolve the role.
 
-    Role/purpose resolution order:
-      1. README-extracted role/purpose (file_roles / file_purposes, keyed
-         by exact file_path) — most accurate, from the repo's own docs.
-      2. Filename/folder inference (_infer_role_from_path) — used when the
-         file has no README-extracted role.
-      3. No role available — header is just "File: <path>".
+    Returns:
+        (full_header_str, resolved_role)
 
-    Purpose is only ever included if it came from the README (filename/folder
-    inference produces a role but not a purpose — there's nothing reliable to
-    say beyond the role itself).
+    full_header is one of:
+      "File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup..."
+      "File: lib/auth.ts | Role: authentication"
+      "File: lib/auth.ts"
 
-    Returns one of:
-      "File: lib/auth.ts | Role: authentication | Purpose: Google OAuth setup and NextAuth adapter configuration"
-      "File: server/controllers/authController.js | Role: authentication"
-      "File: server/app.js"
+    resolved_role is the role string used to build the short header for
+    subsequent chunks (chunk 1+), or None if no role could be determined.
     """
     role    = file_roles.get(file_path)
     purpose = file_purposes.get(file_path)
 
     if role is None:
-        role = _infer_role_from_path(file_path)
-        purpose = None  # inferred roles never carry a purpose
+        role    = _infer_role_from_path(file_path)
+        purpose = None   # inferred roles never carry a purpose string
 
     header = f"File: {file_path}"
     if role:
@@ -201,6 +184,25 @@ def _build_chunk_header(
     if purpose:
         header += f" | Purpose: {purpose}"
 
+    return header, role
+
+
+def _build_short_header(file_path: str, role: Optional[str]) -> str:
+    """
+    Build the short context header prepended to chunk 1+ of a file.
+
+    FIX 5: Every chunk now carries at least "File: <path>" in its embedded
+    text, and "File: <path> | Role: <role>" when a role is known. This
+    ensures retrieval accuracy for questions that find their answer in
+    later chunks of a multi-chunk file — the role signal is present in
+    the embedding regardless of which chunk is returned.
+
+    Purpose is intentionally omitted (only in the full header on chunk 0)
+    to keep the overhead minimal — the short header adds ~10-15 tokens.
+    """
+    header = f"File: {file_path}"
+    if role:
+        header += f" | Role: {role}"
     return header
 
 
@@ -222,12 +224,12 @@ def _split_into_chunks(text: str) -> list[str]:
     if not text:
         return []
 
-    step = CHUNK_SIZE_CHARS - OVERLAP_CHARS
+    step   = CHUNK_SIZE_CHARS - OVERLAP_CHARS
     chunks = []
-    start = 0
+    start  = 0
 
     while start < len(text):
-        end = start + CHUNK_SIZE_CHARS
+        end   = start + CHUNK_SIZE_CHARS
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
@@ -249,76 +251,66 @@ def chunk_file(
     """
     Chunk a single file and attach metadata to each chunk.
 
+    FIX 5 — context header on every chunk:
+      Previously, the context header ("File: ... | Role: ... | Purpose: ...")
+      was prepended to the file content BEFORE the sliding window ran. This
+      meant the header only appeared in chunk 0's text. Chunks 1, 2, 3, etc.
+      started wherever the window landed in the raw code — no role context.
+
+      Now the process is:
+        1. Run the sliding window on the raw file content (no header yet)
+           → produces raw_chunks[0], raw_chunks[1], ...
+        2. Prepend the FULL header to raw_chunks[0] (includes Purpose if known)
+        3. Prepend the SHORT header to raw_chunks[1+] (file path + role only)
+
+      Every chunk now carries file path and role in its embedded text. The
+      cross-encoder re-ranker (FIX 4) also benefits from this because it
+      sees the file context in every chunk it evaluates.
+
     Parameters:
         file            Dict with keys: path, content, ext
-                        (as returned by GitHubClient.get_indexable_files)
         repo_metadata   The repo-level metadata dict from metadata_generator.py
-                        (repo_name, repo_description, repo_technologies, etc.)
-        file_roles      Optional dict {file_path: role} from metadata_generator.py.
-                        Empty/None if the repo's README had no curated file list.
-        file_purposes   Optional dict {file_path: purpose} from metadata_generator.py.
-                        Empty/None if the repo's README had no curated file list.
-
-    Before chunking, a one-line context header is prepended to the file's
-    content (see _build_chunk_header). This header becomes part of chunk 0's
-    text — subsequent chunks are produced by the normal sliding window over
-    the header+content string, so the header only meaningfully affects the
-    first chunk's embedding.
+        file_roles      Optional dict {file_path: role} from metadata_generator.py
+        file_purposes   Optional dict {file_path: purpose} from metadata_generator.py
 
     Returns a list of chunk dicts. Each chunk dict contains everything needed
-    for embedding and Deep Lake storage:
+    for embedding and Deep Lake storage.
 
-    {
-        "text":        <the chunk text, chunk 0 prefixed with the context header>,
-        "repo_name":   "claimsense",
-        "repo_description": "...",
-        "repo_technologies": [...],
-        "repo_purpose": "web app",
-        "repo_language": "python",
-        "deployment_url": "https://...",
-        "repo_topics": [...],
-        "metadata_source": "readme",
-        "metadata_confidence": "high",
-        "file_path":   "src/parser.py",
-        "file_type":   ".py",
-        "file_role":   "authentication" | None,
-        "chunk_index": 0,
-        "indexed_at":  "2026-06-10T12:00:00+00:00"
-    }
-
-    Returns an empty list if the file content produces no chunks
-    (empty file, whitespace only).
+    Returns an empty list if the file content produces no chunks.
     """
     content  = file.get("content", "")
     path     = file.get("path", "")
     ext      = file.get("ext", "")
 
-    file_roles    = file_roles or {}
+    file_roles    = file_roles    or {}
     file_purposes = file_purposes or {}
 
-    # Build the context header and prepend it to the file content.
-    header        = _build_chunk_header(path, file_roles, file_purposes)
-    resolved_role = file_roles.get(path) or _infer_role_from_path(path)
+    # Resolve role and build headers.
+    full_header,  resolved_role = _build_full_header(path, file_roles, file_purposes)
+    short_header                = _build_short_header(path, resolved_role)
 
-    content_with_header = f"{header}\n\n{content}"
-
-    raw_chunks = _split_into_chunks(content_with_header)
+    # FIX 5: Run the sliding window on the RAW content (not header+content).
+    # We'll prepend the appropriate header to each chunk individually below.
+    raw_chunks = _split_into_chunks(content)
     if not raw_chunks:
         return []
 
     timestamp = datetime.now(timezone.utc).isoformat()
 
     result = []
-    for idx, chunk_text in enumerate(raw_chunks):
+    for idx, raw_chunk_text in enumerate(raw_chunks):
+        # Prepend full header to chunk 0, short header to all subsequent chunks.
+        if idx == 0:
+            chunk_text = f"{full_header}\n\n{raw_chunk_text}"
+        else:
+            chunk_text = f"{short_header}\n\n{raw_chunk_text}"
+
         chunk = {
             # The actual content that gets embedded and stored.
-            # Chunk 0 includes the context header; later chunks are raw content
-            # as produced by the sliding window over content_with_header.
+            # Every chunk now carries a context header (full or short).
             "text": chunk_text,
 
             # Repo-level metadata — copied from repo_metadata.
-            # Every field is present on every chunk so retrieval
-            # never needs a second lookup.
             "repo_name":           repo_metadata.get("repo_name"),
             "repo_description":    repo_metadata.get("repo_description"),
             "repo_technologies":   repo_metadata.get("repo_technologies", []),
@@ -329,12 +321,25 @@ def chunk_file(
             "metadata_source":     repo_metadata.get("metadata_source"),
             "metadata_confidence": repo_metadata.get("metadata_confidence"),
 
+            # Richer structural metadata fields.
+            "has_authentication":   repo_metadata.get("has_authentication", False),
+            "has_database":         repo_metadata.get("has_database", False),
+            "database_type":        repo_metadata.get("database_type"),
+            "has_api":              repo_metadata.get("has_api", False),
+            "api_style":            repo_metadata.get("api_style"),
+            "has_frontend":         repo_metadata.get("has_frontend", False),
+            "frontend_framework":   repo_metadata.get("frontend_framework"),
+            "architecture_pattern": repo_metadata.get("architecture_pattern"),
+            "key_features":         repo_metadata.get("key_features", []),
+            "external_services":    repo_metadata.get("external_services", []),
+            "has_tests":            repo_metadata.get("has_tests", False),
+
             # File-level fields.
             "file_path":    path,
             "file_type":    ext,
             "file_role":    resolved_role,
 
-            # Chunk position within this file.
+            # Chunk position within this file (per-file, starts at 0).
             "chunk_index":  idx,
 
             # Timestamp of when this chunk was indexed.
@@ -370,8 +375,8 @@ def chunk_repo_files(
         if chunks:
             all_chunks.extend(chunks)
 
-    repo_name  = repo_metadata.get("repo_name", "unknown")
-    file_count = len(files)
+    repo_name   = repo_metadata.get("repo_name", "unknown")
+    file_count  = len(files)
     chunk_count = len(all_chunks)
     print(f"  [chunker] {repo_name}: {file_count} files → {chunk_count} chunks")
 

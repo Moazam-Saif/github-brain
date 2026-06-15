@@ -20,8 +20,8 @@ HOW IT WORKS:
   regardless of dataset size, making it fast enough for free tier use.
 
 SEARCH MODES:
-  hybrid_search(query_vector, query_text, repo_name=None)  → BM25 + cosine via RRF (default)
-  similarity_search(query_vector, repo_name=None)          → cosine-only fallback
+  hybrid_search(query_vector, query_text, repo_name=None)  → BM25 + cosine via RRF (primary)
+  similarity_search(query_vector, repo_name=None)          → cosine-only (used by aggregation)
   similarity_search_per_repo(query_vector)                 → best chunk per repo
   similarity_search_aggregated(query_vector)               → repo-level scoring
   list_all_repos()                                         → metadata summaries, no vectors
@@ -37,6 +37,33 @@ WHY HYBRID SEARCH:
   RRF formula: score(chunk) = 1/(k + cosine_rank) + 1/(k + bm25_rank)
   where k=60 is the standard RRF constant that dampens rank differences.
 
+BM25 TOKENIZATION (FIX 1 — camelCase/snake_case):
+  The original implementation used plain whitespace splitting: .lower().split()
+  This means getUserByEmail stayed as one token "getuserbyemail", and a query
+  asking about "getUserByEmail" would produce token "getuserbyemail" — no match
+  because the code chunk tokenized it the same way. Identifiers like
+  prisma.user.findUnique or NextAuthOptions never overlap with query tokens.
+
+  Fix: _tokenize() splits on camelCase transitions AND non-alphanumeric chars,
+  so getUserByEmail → ["get", "user", "by", "email"] and the query
+  "how does getUserByEmail work" → ["how", "does", "get", "user", "by",
+  "email", "work"]. Now BM25 scores the chunk containing getUserByEmail highly
+  because "get", "user", "by", "email" all match.
+
+  Applied symmetrically to both the index (chunk texts) and the query string
+  in hybrid_search, so the token vocabularies are always aligned.
+
+FAST TEXT/METADATA LOADING (FIX 3 — no integer indexing in loop):
+  The original _load_all used:
+    all_texts = [str(ds.text[i].numpy()) for i in range(total)]
+  Deep Lake warns that integer indexing in a for loop is slow and recommends
+  enumerate(ds.tensor) instead. With 21 repos and hundreds of chunks, the
+  per-row network overhead was noticeable.
+
+  Fix: use enumerate(ds.text) and enumerate(ds.metadata) which use Deep Lake's
+  optimised iterator path. The embedding matrix still uses ds.embedding.numpy()
+  (bulk load in one call) which was already optimal.
+
 WHY ONE DATASET FOR ALL REPOS:
   Keeping everything in one dataset (hub://ORG/github_brain_v5) lets us do
   cross-repo search trivially — no joining, no federation. Filtering to a
@@ -46,21 +73,15 @@ DELETION STRATEGY (rewrite-in-place, not ds.pop()):
   Deep Lake 3.x has a known internal bug — calling ds.pop() on a dataset that
   already has committed data raises "OverflowError: can't convert negative int
   to unsigned" inside Deep Lake's own commit-diff tracking (chunk_engine.py).
-  This is a bug in Deep Lake itself, not in this code.
 
-  Also note: deeplake.delete() permanently retires the dataset path — "Once
-  deleted, dataset names can't be reused in the Deep Lake Cloud." So deleting
-  and recreating the dataset on every re-index would burn through path names
-  (github_brain_v6, v7, v8, ...) forever.
-
-  The fix used in delete_repo_chunks(): load everything, filter out the target
-  repo's rows in memory, reset the dataset content IN PLACE at the same path
-  using deeplake.empty(path, overwrite=True) — which resets content without
-  retiring the path — then re-append the rows from other repos. This is the
-  same pattern used by LangChain/LlamaIndex's DeepLakeVectorStore(overwrite=True).
+  Also: deeplake.delete() permanently retires the dataset path. The fix used in
+  delete_repo_chunks(): load everything, filter out the target repo's rows in
+  memory, reset the dataset content IN PLACE at the same path using
+  deeplake.empty(path, overwrite=True), then re-append the kept rows.
 """
 
 import os
+import re
 import json
 import numpy as np
 import deeplake
@@ -162,27 +183,7 @@ def delete_repo_chunks(repo_name: str) -> int:
     Remove every chunk belonging to a specific repo.
     Called before re-indexing a repo to avoid duplicates.
 
-    WHY NOT ds.pop():
-      Deep Lake 3.x raises "OverflowError: can't convert negative int to
-      unsigned" inside its own commit-diff tracking (chunk_engine.py,
-      pop_samples) when popping rows from a dataset with committed history.
-      This is an internal Deep Lake bug, not something fixable from our side.
-
-    WHY NOT deeplake.delete() + recreate:
-      deeplake.delete() permanently retires the dataset path — the name
-      can never be reused. Doing this on every single-repo re-index would
-      require a new dataset name (v6, v7, v8, ...) every time, which is
-      unworkable.
-
-    HOW THIS WORKS INSTEAD (rewrite-in-place):
-      1. Load all chunks (embeddings, texts, metadata) currently stored.
-      2. Filter out rows belonging to repo_name — keep everything else.
-      3. Reset the dataset's content IN PLACE at the same path using
-         deeplake.empty(path, overwrite=True). This clears all rows and
-         tensors but does NOT retire the path (unlike deeplake.delete()).
-      4. Recreate the three tensors.
-      5. Re-append the kept rows (chunks belonging to other repos).
-
+    Uses rewrite-in-place strategy — see module docstring for rationale.
     Returns the number of chunks removed for repo_name.
     """
     path  = _get_dataset_path()
@@ -195,7 +196,6 @@ def delete_repo_chunks(repo_name: str) -> int:
         print(f"  [deeplake] Dataset is empty, nothing to delete for: {repo_name}")
         return 0
 
-    # Load everything currently in the dataset.
     embeddings, texts, metas = _load_all(repo_name=None)
 
     keep_indices  = [i for i, m in enumerate(metas) if m.get("repo_name") != repo_name]
@@ -214,7 +214,6 @@ def delete_repo_chunks(repo_name: str) -> int:
         embedding_dim   = embeddings.shape[1] if embeddings.ndim == 2 else 768
         kept_embeddings = np.empty((0, embedding_dim), dtype=np.float32)
 
-    # Reset the dataset content in place — does NOT retire the path.
     ds = deeplake.empty(path, token=token, overwrite=True)
     with ds:
         ds.create_tensor("embedding", htype="embedding",
@@ -222,10 +221,8 @@ def delete_repo_chunks(repo_name: str) -> int:
         ds.create_tensor("text",      htype="text")
         ds.create_tensor("metadata",  htype="json")
 
-    # Re-load a clean handle, consistent with get_or_create_dataset's pattern.
     ds = deeplake.load(path, token=token)
 
-    # Re-append rows from other repos.
     if kept_texts:
         with ds:
             for i in range(len(kept_texts)):
@@ -248,12 +245,14 @@ def _load_all(repo_name: Optional[str] = None) -> tuple[np.ndarray, list[str], l
     """
     Load all embeddings, texts, and metadata from the dataset in one pass.
 
-    This is the core of the fast search approach:
-      - One call to ds.embedding.numpy() loads ALL vectors as a matrix (N, 768)
-      - One call to ds.metadata.numpy() loads ALL metadata strings
-      - No per-row network calls
+    FIX 3 — fast iterator for text and metadata:
+      The original implementation indexed by integer in a for loop:
+        all_texts = [str(ds.text[i].numpy()) for i in range(total)]
+      Deep Lake warns this is slow and recommends enumerate(ds.tensor) instead,
+      which uses the optimised iterator path with prefetching.
 
-    If repo_name is given, filters to only that repo's rows before returning.
+      Embeddings already used ds.embedding.numpy() (bulk matrix load) which
+      was already optimal and is unchanged.
 
     Returns:
         embeddings  np.ndarray shape (N, 768)
@@ -266,21 +265,27 @@ def _load_all(repo_name: Optional[str] = None) -> tuple[np.ndarray, list[str], l
     if total == 0:
         return np.array([]), [], []
 
-    # Load everything in bulk.
     try:
+        # Bulk load embeddings — one network call, returns full matrix.
         all_embeddings = ds.embedding.numpy()   # shape: (total, 768)
-        all_texts      = [str(ds.text[i].numpy()) for i in range(total)]
-        all_metas      = []
-        for i in range(total):
+
+        # FIX 3: use enumerate(ds.text) instead of ds.text[i] in a range loop.
+        # Deep Lake's iterator is significantly faster than integer indexing.
+        all_texts = [str(sample.numpy()) for _, sample in enumerate(ds.text)]
+
+        # FIX 3: same for metadata.
+        all_metas = []
+        for _, sample in enumerate(ds.metadata):
             try:
-                raw = ds.metadata[i].numpy()
-                if hasattr(raw, 'item'):
+                raw = sample.numpy()
+                if hasattr(raw, "item"):
                     raw = raw.item()
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8")
                 all_metas.append(json.loads(str(raw)))
             except Exception:
                 all_metas.append({})
+
     except Exception as e:
         print(f"  [deeplake] Error loading data: {e}")
         return np.array([]), [], []
@@ -288,7 +293,6 @@ def _load_all(repo_name: Optional[str] = None) -> tuple[np.ndarray, list[str], l
     if repo_name is None:
         return all_embeddings, all_texts, all_metas
 
-    # Filter to the requested repo.
     indices = [i for i, m in enumerate(all_metas)
                if m.get("repo_name") == repo_name]
 
@@ -303,22 +307,61 @@ def _load_all(repo_name: Optional[str] = None) -> tuple[np.ndarray, list[str], l
 
 
 # ---------------------------------------------------------------------------
-# Read: BM25 index builder (internal)
+# BM25 tokenization (FIX 1 — camelCase / snake_case / path-aware)
 # ---------------------------------------------------------------------------
+
+def _tokenize(text: str) -> list[str]:
+    """
+    Tokenize text for BM25 in a way that handles code identifiers correctly.
+
+    FIX 1: The original whitespace-only tokenization (.lower().split()) kept
+    camelCase identifiers as single tokens. getUserByEmail became one token
+    "getuserbyemail", so a query containing "getUserByEmail" produced a token
+    that never matched individual words in code chunks.
+
+    This function splits on BOTH camelCase transitions AND non-alphanumeric
+    characters (underscores, dots, slashes, hyphens, punctuation), so:
+      getUserByEmail     → ["get", "user", "by", "email"]
+      prisma.user.create → ["prisma", "user", "create"]
+      lib/auth.ts        → ["lib", "auth", "ts"]
+      NextAuthOptions    → ["next", "auth", "options"]
+      work?              → ["work"]   (punctuation stripped)
+
+    Applied symmetrically to both corpus texts and query strings, so the
+    token vocabularies are always aligned regardless of source.
+
+    Tokens shorter than 2 characters are dropped (noise: single letters,
+    leftover punctuation fragments).
+    """
+    # Insert space before uppercase letters that follow lowercase letters
+    # (camelCase split: getUserByEmail → get User By Email)
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    # Insert space before uppercase runs followed by lowercase
+    # (handles abbreviations: HTMLParser → HTML Parser)
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+
+    text = text.lower()
+
+    # Split on anything that isn't a letter or digit.
+    tokens = re.split(r"[^a-z0-9]+", text)
+
+    # Drop empty strings and single-character noise tokens.
+    return [t for t in tokens if len(t) >= 2]
+
 
 def _build_bm25_index(texts: list[str]) -> BM25Okapi:
     """
-    Build a BM25 index from a list of chunk texts.
+    Build a BM25 index from a list of chunk texts using subword tokenization.
 
-    Tokenization is simple whitespace + lowercase split — sufficient for
-    code since identifiers, keywords, and filenames are space-separated
-    in the context headers and code content.
+    FIX 1: Previously used .lower().split() (whitespace only). Now uses
+    _tokenize() which splits camelCase and non-alphanumeric boundaries so
+    code identifiers, file paths, and function names are correctly indexed
+    as individual tokens rather than opaque single-token blobs.
 
-    BM25Okapi is the standard Okapi BM25 variant: TF is saturated so very
-    frequent terms don't dominate, and IDF penalises terms that appear in
-    most chunks (common boilerplate).
+    BM25Okapi applies TF saturation (very frequent terms don't dominate)
+    and IDF weighting (rare terms score higher than common boilerplate).
     """
-    tokenized = [text.lower().split() for text in texts]
+    tokenized = [_tokenize(text) for text in texts]
     return BM25Okapi(tokenized)
 
 
@@ -347,28 +390,23 @@ def hybrid_search(
       gives lexical precision AND semantic coverage simultaneously.
 
     HOW RRF WORKS:
-      Rather than combining raw scores (which have incompatible scales),
-      RRF combines ranks:
+      RRF_score(chunk) = 1/(k + cosine_rank) + 1/(k + bm25_rank)
+      where k=60 is the standard constant. A chunk ranked #1 by both methods
+      gets the highest combined score.
 
-        RRF_score(chunk) = 1/(k + cosine_rank) + 1/(k + bm25_rank)
-
-      where k=60 is the standard constant that prevents top-ranked documents
-      from dominating too strongly. A chunk ranked #1 by both methods gets
-      the highest combined score. A chunk ranked #1 by cosine but #50 by BM25
-      still scores well but not as high as a consensus top result.
+    FIX 1 applied here: query_text is tokenized via _tokenize() (not
+    .lower().split()) so camelCase and path-based query terms match the
+    identically tokenized corpus.
 
     Parameters:
         query_vector  768-dim float list from embedder.embed_query()
-        query_text    Raw query string — used for BM25 tokenization
+        query_text    Raw query string — tokenized via _tokenize() for BM25
         top_k         Number of results to return
         repo_name     If given, search only within this repo.
-                      If None, search across all repos.
 
-    Returns list of dicts sorted by RRF score descending:
-    [{"text": "...", "score": 0.031, "repo_name": "...", "file_path": "...", ...}]
-
-    Note: RRF scores are not cosine similarities — they're rank-fusion scores
-    (typically in range 0.01–0.04). Higher is still better.
+    Returns list of dicts sorted by RRF score descending.
+    Note: RRF scores are rank-fusion scores (typically 0.01–0.04), not
+    cosine similarities. Higher is still better.
     """
     embeddings, texts, metas = _load_all(repo_name=repo_name)
 
@@ -386,25 +424,27 @@ def hybrid_search(
         return []
     query_np = query_np / query_norm
 
-    norms      = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms      = np.where(norms == 0, 1, norms)
-    normalized = embeddings / norms
+    norms        = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms        = np.where(norms == 0, 1, norms)
+    normalized   = embeddings / norms
     dense_scores = normalized @ query_np   # shape (N,)
 
     # --- Sparse scores (BM25) ---
+    # FIX 1: use _tokenize() instead of .lower().split() for both
+    # the corpus index and the query tokens.
     bm25          = _build_bm25_index(texts)
+    query_tokens  = _tokenize(query_text)
     sparse_scores = np.array(
-        bm25.get_scores(query_text.lower().split()),
+        bm25.get_scores(query_tokens),
         dtype=np.float32,
     )
 
     # --- Reciprocal Rank Fusion ---
-    # argsort ascending then argsort again gives rank (0 = worst, N-1 = best)
-    # We want rank 0 = best, so invert: rank = (N-1) - rank_ascending
-    RRF_K = 60   # standard constant
+    RRF_K = 60
 
-    dense_rank_asc  = np.argsort(np.argsort(dense_scores))   # 0 = worst
-    sparse_rank_asc = np.argsort(np.argsort(sparse_scores))  # 0 = worst
+    # argsort twice gives rank (0 = worst, N-1 = best)
+    dense_rank_asc  = np.argsort(np.argsort(dense_scores))
+    sparse_rank_asc = np.argsort(np.argsort(sparse_scores))
 
     # Convert to descending rank (0 = best) for RRF formula
     dense_rank  = (n - 1) - dense_rank_asc
@@ -415,7 +455,6 @@ def hybrid_search(
         1.0 / (RRF_K + sparse_rank)
     )
 
-    # Get top_k results
     actual_k    = min(top_k, n)
     top_indices = np.argsort(rrf_scores)[-actual_k:][::-1]
 
@@ -431,7 +470,7 @@ def hybrid_search(
 
 
 # ---------------------------------------------------------------------------
-# Read: cosine-only similarity search (kept as fallback / for aggregation)
+# Read: cosine-only similarity search (used internally by aggregation)
 # ---------------------------------------------------------------------------
 
 def similarity_search(
@@ -441,24 +480,8 @@ def similarity_search(
 ) -> list[dict]:
     """
     Find the top-k chunks most semantically similar to a query vector.
-    Pure cosine similarity — used internally by aggregated search.
-
+    Pure cosine similarity — used internally by aggregated/per-repo search.
     For the primary retrieval path, use hybrid_search() instead.
-
-    HOW IT WORKS:
-      1. Load all embeddings as a matrix M of shape (N, 768) — one network call
-      2. Normalize M and the query vector to unit length
-      3. Compute M @ query_vector — one matrix multiply, gives N cosine scores
-      4. argsort scores, take top_k indices
-      5. Build result dicts from those indices
-
-    Parameters:
-        query_vector  768-dim float list from embedder.embed_query()
-        top_k         Max number of results to return
-        repo_name     If given, search only within this repo.
-                      If None, search across all repos.
-
-    Returns list of dicts sorted by similarity score descending.
     """
     embeddings, texts, metas = _load_all(repo_name=repo_name)
 
@@ -474,23 +497,22 @@ def similarity_search(
         return []
     query_np = query_np / query_norm
 
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1, norms)
+    norms      = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms      = np.where(norms == 0, 1, norms)
     normalized = embeddings / norms
 
-    scores = normalized @ query_np   # shape: (N,)
+    scores = normalized @ query_np
 
     actual_k    = min(top_k, len(scores))
     top_indices = np.argsort(scores)[-actual_k:][::-1]
 
     results = []
     for idx in top_indices:
-        result = {
+        results.append({
             "text":  texts[idx],
             "score": float(scores[idx]),
             **metas[idx],
-        }
-        results.append(result)
+        })
 
     return results
 
@@ -501,20 +523,11 @@ def similarity_search_per_repo(
 ) -> list[dict]:
     """
     Return the single best-matching chunk per repo for a given query.
-    Uses cosine similarity (not hybrid) since BM25 per-repo is expensive
-    and this function is used for cross-repo semantic coverage, not precision.
+    Uses cosine similarity — BM25 per-repo is expensive and this function
+    is used for cross-repo semantic coverage, not within-repo precision.
 
-    WHY THIS EXISTS:
-      Regular similarity_search(top_k=6) returns the 6 highest-scoring
-      chunks globally. For "do any repos implement rate limiting?", those
-      6 chunks might all be from 1-2 repos, completely missing other repos
-      that also have rate limiting but scored 7th, 8th, 9th overall.
-
-      This function guarantees every repo gets exactly one representative
-      chunk — its highest-scoring one — so Gemini can make a complete
-      assessment across all repos.
-
-    Returns list of chunk dicts, one per repo, sorted by score descending.
+    Guarantees every repo gets exactly one representative chunk so Gemini
+    can assess all repos, not just those that dominated global top-k.
     """
     embeddings, texts, metas = _load_all(repo_name=None)
 
@@ -530,9 +543,8 @@ def similarity_search_per_repo(
     norms      = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms      = np.where(norms == 0, 1, norms)
     normalized = embeddings / norms
-    scores     = normalized @ query_np   # shape (N,)
+    scores     = normalized @ query_np
 
-    # For each repo, find the index of its best-scoring chunk.
     best: dict[str, tuple[int, float]] = {}
     for i, meta in enumerate(metas):
         repo = meta.get("repo_name", "unknown")
@@ -566,16 +578,12 @@ def similarity_search_aggregated(
     candidate_k: int = 50,
 ) -> list[dict]:
     """
-    Score repos as a whole rather than returning individual top-k chunks.
-    Uses cosine similarity internally (same as before) since the aggregation
-    logic already handles the fairness problem that hybrid search solves
-    at the chunk level.
+    Score repos as a whole for comparative questions ("which repo has the best auth?").
 
-    WHY THIS EXISTS:
-      For comparative questions ("which repo has the best auth?"), global
-      top-k returns chunks from the repo with the most auth-related content,
-      crowding out other repos. This function scores each repo as the average
-      of its top-3 chunk scores and ranks repos by that aggregate score.
+    Uses cosine internally — the aggregation logic (avg of top-3 chunk scores
+    per repo) already addresses the fairness problem that hybrid search solves
+    at the chunk level. Applying hybrid here would add BM25 cost with no
+    additional benefit since repo ranking is by aggregate score, not precision.
 
     Returns list of repo result dicts sorted by repo_score descending.
     """
@@ -637,11 +645,10 @@ def list_all_repos() -> list[dict]:
 
     Used by:
       - query engine for list_repos questions (no vector search)
-      - query engine for cross_repo_metadata questions (filter by field)
-      - CLI to show what's indexed
+      - query engine for cross_repo_metadata questions
+      - engine.py for repo name normalization (cached in session — see engine.py)
 
     Does not load embeddings — only reads metadata, which is fast.
-
     Returns list sorted by repo_name.
     """
     _, _, all_metas = _load_all(repo_name=None)
@@ -651,14 +658,14 @@ def list_all_repos() -> list[dict]:
         repo_name = meta.get("repo_name")
         if repo_name and repo_name not in seen:
             seen[repo_name] = {
-                "repo_name":           repo_name,
-                "repo_description":    meta.get("repo_description"),
-                "repo_technologies":   meta.get("repo_technologies", []),
-                "repo_purpose":        meta.get("repo_purpose"),
-                "repo_language":       meta.get("repo_language"),
-                "deployment_url":      meta.get("deployment_url"),
-                "repo_topics":         meta.get("repo_topics", []),
-                "metadata_confidence": meta.get("metadata_confidence"),
+                "repo_name":            repo_name,
+                "repo_description":     meta.get("repo_description"),
+                "repo_technologies":    meta.get("repo_technologies", []),
+                "repo_purpose":         meta.get("repo_purpose"),
+                "repo_language":        meta.get("repo_language"),
+                "deployment_url":       meta.get("deployment_url"),
+                "repo_topics":          meta.get("repo_topics", []),
+                "metadata_confidence":  meta.get("metadata_confidence"),
                 "has_authentication":   meta.get("has_authentication", False),
                 "has_database":         meta.get("has_database", False),
                 "database_type":        meta.get("database_type"),

@@ -4,12 +4,13 @@ query/retriever.py
 PURPOSE:
   Translates a classified question into actual search results from Deep Lake.
   Sits between the engine (which decides what to search) and the store
-  (which executes the search). Owns query enrichment and deduplication.
+  (which executes the search). Owns query enrichment, re-ranking,
+  and deduplication.
 
 HOW IT WORKS:
   Four retrieval strategies — one per query type:
 
-  retrieve_cross_repo_metadata(question)
+  retrieve_cross_repo_metadata()
     Does NOT do vector search. Calls list_all_repos() to get every repo's
     metadata summary. The engine passes it to Gemini which filters and
     answers in natural language. Fast — no embeddings involved.
@@ -26,36 +27,64 @@ HOW IT WORKS:
 
   retrieve_repo_specific(question, repo_name, conversation_history, seen_chunk_ids)
     Uses HYBRID SEARCH (BM25 + cosine via RRF) on the enriched query,
-    filtered to the target repo. This is the primary search path and the
-    one that benefits most from hybrid retrieval.
+    filtered to the target repo, followed by CROSS-ENCODER RE-RANKING.
+    This is the primary search path and the one that benefits most from
+    both hybrid retrieval and re-ranking.
 
-    WHY HYBRID HERE SPECIFICALLY:
-      This is where the pure cosine failure mode showed up — "how does
-      authentication work" returning session/chat files instead of lib/auth.ts.
-      BM25 catches exact term matches (e.g. "auth" in lib/auth.ts filename and
-      code), while cosine catches semantic intent. RRF fuses both rankings so
-      a file that's lexically AND semantically relevant rises to the top.
+FIX 4 — CROSS-ENCODER RE-RANKER:
+  After hybrid_search returns 20 candidates, a cross-encoder model
+  (cross-encoder/ms-marco-MiniLM-L-6-v2) re-scores each (query, chunk)
+  pair jointly. Unlike bi-encoders which embed query and chunk separately,
+  a cross-encoder sees both together and captures their precise interaction.
 
-    WHY ENRICHMENT:
-      Follow-up questions like "how does that connect to the DB?" have no
-      meaning in isolation. Adding prior exchange as context makes the
-      embedding capture the right semantic direction.
+  This directly addresses the chunk boundary problem (weakness 4): even if
+  a chunk's cosine/BM25 scores were mediocre because the function signature
+  was in a neighbouring chunk, the cross-encoder can recognise that the
+  chunk's CONTENT is highly relevant to the question and boost its rank.
 
-    WHY DEDUPLICATION:
-      Without it, the same highly-relevant chunk gets returned every turn,
-      wasting context space and making answers repetitive.
+  Pipeline for retrieve_repo_specific:
+    hybrid_search (top 20) → cross-encoder re-rank → deduplication → top 5
+
+  The cross-encoder model is loaded lazily on first use (not at import time)
+  so startup is not penalised for query types that don't use it.
+  Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (~22MB, CPU-only, ~50ms/pair)
+
+FIX 7 — SEEN_CHUNK_IDS STARVATION:
+  The original implementation used a plain set() for seen_chunk_ids that
+  grew indefinitely across turns. In a long session (10+ turns) over a small
+  repo (~40-50 chunks), 5 chunks × 10 turns = 50 seen IDs can exhaust the
+  entire repo's chunk pool. When hybrid_search returns 20 candidates and all
+  20 are in seen_chunk_ids, fresh returns empty and the user gets
+  "I couldn't find relevant code" even for valid questions.
+
+  Fix: seen_chunk_ids is now a collections.deque with maxlen=40. When the
+  deque is full, the oldest entry is automatically evicted to make room for
+  the newest. This means chunks from 8+ turns ago become eligible for
+  retrieval again, while chunks from the last 8 turns are still suppressed
+  to avoid immediate repetition.
+
+  The deque is stored in the session dict in engine.py. Membership testing
+  (cid not in seen_chunk_ids) works identically for deque as for set.
+  Adding new IDs uses seen_chunk_ids.append(cid) instead of .add(cid).
+
+  MAXLEN=40 rationale: 5 chunks/turn × 8 turns = 40 — suppresses the most
+  recent 8 turns of chunks while keeping the deque small. For a repo with
+  40 total chunks this means at worst 1-2 turns of "already seen" overlap
+  before chunks cycle back in, which is acceptable.
 
 TOP-K VALUES:
-  cross_repo_semantic → per-repo (one chunk per repo, up to 10 repos)
-  repo_specific       → 5 final chunks (fetches 20 raw via hybrid, deduplicates down to 5)
+  cross_repo_semantic  → per-repo (one chunk per repo, up to 10 repos)
+  repo_specific        → 5 final chunks after re-rank + dedup
+                         (fetches 20 raw via hybrid, re-ranks all 20,
+                         deduplicates down to 5)
 """
 
 import hashlib
+from collections import deque
 from typing import Optional
 
 from indexer.embedder       import embed_query
 from indexer.deeplake_store import (hybrid_search,
-                                    similarity_search,
                                     similarity_search_per_repo,
                                     similarity_search_aggregated,
                                     list_all_repos)
@@ -65,10 +94,95 @@ from indexer.deeplake_store import (hybrid_search,
 # Constants
 # ---------------------------------------------------------------------------
 
-TOP_K_REPO_SPECIFIC      = 5    # final chunks returned per turn in a deep dive
-TOP_K_HYBRID_FETCH       = 20   # raw candidates fetched before deduplication
-                                 # wider than before (was 10) because hybrid
-                                 # scoring changes rank ordering significantly
+TOP_K_REPO_SPECIFIC  = 5    # final chunks returned per turn in a deep dive
+TOP_K_HYBRID_FETCH   = 20   # raw candidates fetched before re-rank + dedup
+                             # wider than pure cosine (was 10) because hybrid
+                             # scoring changes rank ordering significantly,
+                             # and re-ranker needs headroom to promote chunks
+
+SEEN_CHUNK_MAXLEN    = 40   # FIX 7: cap on seen_chunk_ids deque
+                             # 5 chunks/turn × 8 turns = 40
+                             # oldest entries evicted automatically when full
+
+
+# ---------------------------------------------------------------------------
+# Re-ranker (FIX 4)
+# ---------------------------------------------------------------------------
+
+_reranker_model = None   # lazy-loaded on first use
+
+
+def _get_reranker():
+    """
+    Lazy-load the cross-encoder re-ranker model.
+
+    Model: cross-encoder/ms-marco-MiniLM-L-6-v2
+      - ~22MB download on first run (cached locally by sentence-transformers)
+      - CPU-only, ~50ms per (query, chunk) pair
+      - Trained on MS MARCO passage retrieval — well-suited for Q&A over code
+        because it understands relevance between natural language questions
+        and technical text
+
+    Loaded once and reused for the lifetime of the process. The global
+    variable pattern is intentional — re-loading on every query would add
+    ~2-3 seconds of model init overhead per turn.
+    """
+    global _reranker_model
+    if _reranker_model is None:
+        print("  [retriever] Loading re-ranker model (first use only)...")
+        from sentence_transformers import CrossEncoder
+        _reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        print("  [retriever] Re-ranker model loaded.")
+    return _reranker_model
+
+
+def _rerank(query: str, chunks: list[dict]) -> list[dict]:
+    """
+    Re-score a list of candidate chunks using the cross-encoder model.
+
+    WHY CROSS-ENCODER OVER BI-ENCODER FOR RE-RANKING:
+      Bi-encoders (like Gemini text-embedding-004) embed query and chunk
+      separately into vectors, then compare with cosine similarity. The
+      vectors are computed in isolation — the model never sees query and
+      chunk together, so it can't model their precise interaction.
+
+      Cross-encoders take the concatenated (query, chunk) pair as a single
+      input. Every attention layer can attend from query tokens to chunk
+      tokens and vice versa, making them dramatically more accurate at
+      judging "does this specific chunk answer this specific question?"
+
+    WHY THIS FIXES THE CHUNK BOUNDARY PROBLEM:
+      A chunk that starts mid-function (no signature) may score mediocre on
+      cosine/BM25 because it lacks the function name. But if its content
+      directly answers the question ("return prisma.user.findUnique(...)"),
+      the cross-encoder sees that relevance and scores it high regardless
+      of what's missing from the chunk header.
+
+    Parameters:
+        query   The enriched query string (question + conversation context).
+        chunks  Candidate chunks from hybrid_search, in RRF score order.
+
+    Returns the same chunks sorted by cross-encoder score descending.
+    The original 'score' (RRF) is preserved in the dict; the re-ranker
+    adds a separate 'rerank_score' field for transparency.
+    """
+    if not chunks:
+        return chunks
+
+    reranker = _get_reranker()
+    pairs    = [(query, c["text"]) for c in chunks]
+    scores   = reranker.predict(pairs)   # returns numpy array of floats
+
+    for chunk, score in zip(chunks, scores):
+        chunk["rerank_score"] = float(score)
+
+    ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
+
+    top_files = [f"{c.get('file_path')} ({c.get('rerank_score', 0):.2f})"
+                 for c in ranked[:5]]
+    print(f"  [retriever] Re-ranked. Top files: {' | '.join(top_files)}")
+
+    return ranked
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +205,9 @@ def _build_enriched_query(question: str, conversation_history: list[dict]) -> st
     query with verbose explanations.
 
     NOTE: The enriched query is used for BOTH the cosine embedding AND the
-    BM25 tokenization in hybrid_search. This is intentional — enrichment
-    adds context words that help BM25 find relevant follow-up chunks too.
+    BM25 tokenization in hybrid_search, AND as the query for cross-encoder
+    re-ranking. This is intentional — enrichment adds context words that
+    help all three components find relevant follow-up chunks.
     """
     if not conversation_history:
         return question
@@ -116,13 +231,31 @@ def _build_enriched_query(question: str, conversation_history: list[dict]) -> st
 def _chunk_id(chunk: dict) -> str:
     """
     Stable ID for a chunk: hash of repo_name + file_path + chunk_index.
+
     Used to track which chunks have already been sent to Gemini this session
     so we don't repeat the same code on every follow-up question.
+
+    The hash is deterministic and collision-resistant for our use case
+    (MD5 is fine for deduplication — not used for security).
     """
     key = (f"{chunk.get('repo_name')}::"
            f"{chunk.get('file_path')}::"
            f"{chunk.get('chunk_index')}")
     return hashlib.md5(key.encode()).hexdigest()
+
+
+def make_seen_chunk_ids() -> deque:
+    """
+    Create a new seen_chunk_ids deque for a fresh session.
+
+    FIX 7: Returns a deque with maxlen=SEEN_CHUNK_MAXLEN instead of a plain
+    set. The deque automatically evicts the oldest entry when full, so the
+    pool of suppressed chunks is always bounded. This prevents the starvation
+    issue where a long session exhausts all chunks in a small repo.
+
+    Called by engine.py when starting a new session (in _new_session).
+    """
+    return deque(maxlen=SEEN_CHUNK_MAXLEN)
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +281,12 @@ def retrieve_cross_repo_metadata() -> list[dict]:
 def retrieve_cross_repo_comparative(question: str) -> list[dict]:
     """
     Rank repos fairly for comparative questions like "which has the best auth?".
-    Uses cosine-only aggregated search (similarity_search_aggregated) since
-    the aggregation logic already handles the fairness problem at the repo level.
+
+    Uses cosine-only aggregated search (similarity_search_aggregated) — the
+    aggregation logic (avg of top-3 chunk scores per repo) already handles the
+    fairness problem at the repo level. Hybrid search is applied at the chunk
+    level in retrieve_repo_specific; for cross-repo ranking, cosine aggregation
+    is the right tool.
 
     Returns list of repo result dicts from similarity_search_aggregated().
     """
@@ -175,8 +312,12 @@ def retrieve_cross_repo_comparative(question: str) -> list[dict]:
 def retrieve_cross_repo_semantic(question: str) -> list[dict]:
     """
     Find the best matching chunk per repo for a semantic question.
-    Uses cosine-only per-repo search (similarity_search_per_repo) since
-    the goal here is coverage across repos, not precision within one repo.
+
+    Uses cosine-only per-repo search (similarity_search_per_repo). The goal
+    here is COVERAGE across all repos — ensuring every repo gets a
+    representative chunk so Gemini can determine which repos are relevant.
+    Hybrid search is used for within-repo precision (retrieve_repo_specific);
+    cross-repo coverage is better served by pure cosine which ranks globally.
 
     Returns list of chunk dicts, one per repo, sorted by score descending.
     """
@@ -201,33 +342,39 @@ def retrieve_repo_specific(
     question: str,
     repo_name: str,
     conversation_history: list[dict],
-    seen_chunk_ids: set,
+    seen_chunk_ids: deque,
 ) -> list[dict]:
     """
-    Hybrid search (BM25 + cosine via RRF) within a single repo,
-    with query enrichment and deduplication.
+    Hybrid search (BM25 + cosine via RRF) + cross-encoder re-ranking within
+    a single repo, with query enrichment and deduplication.
 
-    This is the primary retrieval path and the one most improved by
-    hybrid search. Pure cosine was missing lexically correct files
-    (e.g. lib/auth.ts for "how does authentication work") because
-    semantically adjacent files (session/chat code) ranked higher.
-    BM25 catches the exact term match; RRF fuses both rankings.
+    This is the primary retrieval path. The full pipeline:
+      1. Enrich the query with recent conversation context
+      2. Embed the enriched query (for cosine component of hybrid search)
+      3. Run hybrid_search: BM25 + cosine + RRF, filtered to repo_name
+         → returns TOP_K_HYBRID_FETCH (20) candidates
+      4. Re-rank all 20 candidates with the cross-encoder model
+         → reorders by precise (query, chunk) relevance score
+      5. Deduplicate against seen_chunk_ids (capped deque — FIX 7)
+         → removes chunks already seen this session
+      6. Return up to TOP_K_REPO_SPECIFIC (5) fresh chunks
+
+    WHY HYBRID + RE-RANK (not just one or the other):
+      Hybrid search (step 3) gives strong recall — the right chunks are very
+      likely to be in the top 20 because both BM25 (lexical) and cosine
+      (semantic) are working together. Re-ranking (step 4) gives strong
+      precision — from those 20, the cross-encoder picks the 5 that best
+      answer this specific question. The two are complementary.
 
     Parameters:
         question               Current user question.
         repo_name              Which repo to search within.
         conversation_history   Full session history for query enrichment.
-        seen_chunk_ids         Chunks already used this session (mutated
-                               in place — new IDs added by this function).
+        seen_chunk_ids         Capped deque of chunk IDs already seen this
+                               session (FIX 7). Mutated in place — new IDs
+                               are appended by this function.
 
-    Process:
-      1. Enrich the query with recent conversation context
-      2. Embed the enriched query (for cosine component)
-      3. Run hybrid_search (BM25 + cosine + RRF) filtered to repo_name
-      4. Filter out chunks already seen this session
-      5. Return up to TOP_K_REPO_SPECIFIC fresh chunks
-
-    Returns fresh chunk dicts sorted by RRF score descending.
+    Returns fresh chunk dicts sorted by re-rank score descending.
     """
     enriched = _build_enriched_query(question, conversation_history)
     print(f"  [retriever] Repo-specific hybrid search in '{repo_name}'")
@@ -237,9 +384,7 @@ def retrieve_repo_specific(
         print("  [retriever] Failed to embed query.")
         return []
 
-    # Hybrid search: BM25 + cosine via RRF
-    # Fetch TOP_K_HYBRID_FETCH candidates before deduplication to ensure
-    # we have enough headroom after filtering already-seen chunks.
+    # Step 3: Hybrid search — fetch TOP_K_HYBRID_FETCH candidates.
     raw = hybrid_search(
         query_vector=query_vector,
         query_text=enriched,
@@ -247,16 +392,29 @@ def retrieve_repo_specific(
         repo_name=repo_name,
     )
 
+    if not raw:
+        return []
+
+    # Step 4: Re-rank with cross-encoder.
+    # The enriched query is used (not just the bare question) so the
+    # re-ranker has the same conversational context as the embedding.
+    reranked = _rerank(enriched, raw)
+
+    # Step 5: Deduplicate against seen_chunk_ids.
+    # FIX 7: seen_chunk_ids is a deque with maxlen=SEEN_CHUNK_MAXLEN.
+    # Membership testing works identically to a set. Appending evicts
+    # the oldest entry automatically when the deque is full.
     fresh = []
-    for chunk in raw:
+    for chunk in reranked:
         cid = _chunk_id(chunk)
         if cid not in seen_chunk_ids:
             fresh.append(chunk)
-            seen_chunk_ids.add(cid)
+            seen_chunk_ids.append(cid)   # .append() not .add() — it's a deque
         if len(fresh) >= TOP_K_REPO_SPECIFIC:
             break
 
-    duped = len(raw) - len(fresh)
+    duped = len(reranked) - len(fresh)
     print(f"  [retriever] {len(fresh)} fresh chunks "
-          f"({duped} already seen this session).")
+          f"({duped} already seen this session, "
+          f"{len(seen_chunk_ids)}/{SEEN_CHUNK_MAXLEN} IDs tracked).")
     return fresh
