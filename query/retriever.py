@@ -131,7 +131,10 @@ def _get_reranker():
     if _reranker_model is None:
         print("  [retriever] Loading re-ranker model (first use only)...")
         from sentence_transformers import CrossEncoder
-        _reranker_model = CrossEncoder("jinaai/jina-reranker-v2-base-code")
+        _reranker_model = CrossEncoder(
+            "jinaai/jina-reranker-v2-base-multilingual",
+            trust_remote_code=True,
+            )
         print("  [retriever] Re-ranker model loaded.")
     return _reranker_model
 
