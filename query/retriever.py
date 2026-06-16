@@ -80,6 +80,8 @@ TOP-K VALUES:
 """
 
 import hashlib
+import os
+import requests
 from collections import deque
 from typing import Optional
 
@@ -109,84 +111,40 @@ SEEN_CHUNK_MAXLEN    = 40   # FIX 7: cap on seen_chunk_ids deque
 # Re-ranker (FIX 4)
 # ---------------------------------------------------------------------------
 
-_reranker_model = None   # lazy-loaded on first use
-
-
-def _get_reranker():
-    """
-    Lazy-load the cross-encoder re-ranker model.
-
-    Model: cross-encoder/ms-marco-MiniLM-L-6-v2
-      - ~22MB download on first run (cached locally by sentence-transformers)
-      - CPU-only, ~50ms per (query, chunk) pair
-      - Trained on MS MARCO passage retrieval — well-suited for Q&A over code
-        because it understands relevance between natural language questions
-        and technical text
-
-    Loaded once and reused for the lifetime of the process. The global
-    variable pattern is intentional — re-loading on every query would add
-    ~2-3 seconds of model init overhead per turn.
-    """
-    global _reranker_model
-    if _reranker_model is None:
-        print("  [retriever] Loading re-ranker model (first use only)...")
-        from sentence_transformers import CrossEncoder
-        _reranker_model = CrossEncoder(
-            "jinaai/jina-reranker-v2-base-multilingual",
-            trust_remote_code=True,
-            )
-        print("  [retriever] Re-ranker model loaded.")
-    return _reranker_model
 
 
 def _rerank(query: str, chunks: list[dict]) -> list[dict]:
-    """
-    Re-score a list of candidate chunks using the cross-encoder model.
-
-    WHY CROSS-ENCODER OVER BI-ENCODER FOR RE-RANKING:
-      Bi-encoders (like Gemini text-embedding-004) embed query and chunk
-      separately into vectors, then compare with cosine similarity. The
-      vectors are computed in isolation — the model never sees query and
-      chunk together, so it can't model their precise interaction.
-
-      Cross-encoders take the concatenated (query, chunk) pair as a single
-      input. Every attention layer can attend from query tokens to chunk
-      tokens and vice versa, making them dramatically more accurate at
-      judging "does this specific chunk answer this specific question?"
-
-    WHY THIS FIXES THE CHUNK BOUNDARY PROBLEM:
-      A chunk that starts mid-function (no signature) may score mediocre on
-      cosine/BM25 because it lacks the function name. But if its content
-      directly answers the question ("return prisma.user.findUnique(...)"),
-      the cross-encoder sees that relevance and scores it high regardless
-      of what's missing from the chunk header.
-
-    Parameters:
-        query   The enriched query string (question + conversation context).
-        chunks  Candidate chunks from hybrid_search, in RRF score order.
-
-    Returns the same chunks sorted by cross-encoder score descending.
-    The original 'score' (RRF) is preserved in the dict; the re-ranker
-    adds a separate 'rerank_score' field for transparency.
-    """
+    """Re-rank chunks using the hosted Jina API while preserving existing logic."""
     if not chunks:
         return chunks
-
-    reranker = _get_reranker()
-    pairs    = [(query, c["text"]) for c in chunks]
-    scores   = reranker.predict(pairs)   # returns numpy array of floats
-
-    for chunk, score in zip(chunks, scores):
-        chunk["rerank_score"] = float(score)
-
-    ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
-
-    top_files = [f"{c.get('file_path')} ({c.get('rerank_score', 0):.2f})"
-                 for c in ranked[:5]]
-    print(f"  [retriever] Re-ranked. Top files: {' | '.join(top_files)}")
-
-    return ranked
-
+    api_key = os.environ.get("JINA_API_KEY")
+    if not api_key:
+        print("  [retriever] JINA_API_KEY not set; skipping rerank.")
+        return chunks
+    try:
+        response = requests.post(
+            "https://api.jina.ai/v1/rerank",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "jina-reranker-v2-base-multilingual",
+                "query": query,
+                "documents": [c["text"] for c in chunks],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        for item in payload.get("results", []):
+            chunks[item["index"]]["rerank_score"] = float(item["relevance_score"])
+        ranked = sorted(chunks, key=lambda c: c.get("rerank_score", float("-inf")), reverse=True)
+        print("  [retriever] Re-ranked.")
+        return ranked
+    except Exception as exc:
+        print(f"  [retriever] Jina rerank failed ({exc}); using hybrid ranking.")
+        return chunks
 
 # ---------------------------------------------------------------------------
 # Query enrichment (repo-specific only)
