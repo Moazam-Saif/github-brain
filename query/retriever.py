@@ -20,10 +20,16 @@ HOW IT WORKS:
     chunks with no repo_name filter. Returns one best chunk per repo so
     Gemini can assess every repo, not just those that dominated top-k.
 
-  retrieve_cross_repo_comparative(question)
-    Embeds the question and runs similarity_search_aggregated() which scores
-    each repo as the average of its top-3 chunk scores — fair ranking
-    regardless of repo size or chunk count.
+  retrieve_cross_repo_comparative(question, named_repos=None)
+    When named_repos is None (general comparison — "which repo has the
+    best auth?"): runs similarity_search_aggregated() which scores each
+    repo as the average of its top-3 chunk scores — fair global ranking.
+
+    When named_repos is provided (explicit comparison — "compare CorpLaw-AI
+    and skillswap on auth"): fetches chunks directly from each named repo
+    using hybrid_search(), bypassing the global ranking entirely. This
+    guarantees the repos the user asked about are always represented,
+    regardless of how they score globally.
 
   retrieve_repo_specific(question, repo_name, conversation_history, seen_chunk_ids)
     Uses HYBRID SEARCH (BM25 + cosine via RRF) on the enriched query,
@@ -33,21 +39,15 @@ HOW IT WORKS:
 
 FIX 4 — CROSS-ENCODER RE-RANKER:
   After hybrid_search returns 20 candidates, a cross-encoder model
-  (cross-encoder/ms-marco-MiniLM-L-6-v2) re-scores each (query, chunk)
-  pair jointly. Unlike bi-encoders which embed query and chunk separately,
-  a cross-encoder sees both together and captures their precise interaction.
-
-  This directly addresses the chunk boundary problem (weakness 4): even if
-  a chunk's cosine/BM25 scores were mediocre because the function signature
-  was in a neighbouring chunk, the cross-encoder can recognise that the
-  chunk's CONTENT is highly relevant to the question and boost its rank.
+  re-scores each (query, chunk) pair jointly via the Jina rerank API.
+  Unlike bi-encoders which embed query and chunk separately, a cross-encoder
+  sees both together and captures their precise interaction.
 
   Pipeline for retrieve_repo_specific:
-    hybrid_search (top 20) → cross-encoder re-rank → deduplication → top 5
+    hybrid_search (top 20) → Jina rerank → deduplication → top 5
 
-  The cross-encoder model is loaded lazily on first use (not at import time)
-  so startup is not penalised for query types that don't use it.
-  Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (~22MB, CPU-only, ~50ms/pair)
+  If JINA_API_KEY is not set, re-ranking is skipped and hybrid ranking
+  is used as-is.
 
 FIX 7 — SEEN_CHUNK_IDS STARVATION:
   The original implementation used a plain set() for seen_chunk_ids that
@@ -68,12 +68,25 @@ FIX 7 — SEEN_CHUNK_IDS STARVATION:
   Adding new IDs uses seen_chunk_ids.append(cid) instead of .add(cid).
 
   MAXLEN=40 rationale: 5 chunks/turn × 8 turns = 40 — suppresses the most
-  recent 8 turns of chunks while keeping the deque small. For a repo with
-  40 total chunks this means at worst 1-2 turns of "already seen" overlap
-  before chunks cycle back in, which is acceptable.
+  recent 8 turns of chunks while keeping the deque small.
+
+NAMED REPO FILTERING (cross_repo_comparative):
+  When the user explicitly names repos in a comparative question
+  (e.g. "compare CorpLaw-AI and Claim-Verification on database design"),
+  the router extracts those names into route["repos"]. The engine passes
+  them here as named_repos.
+
+  Instead of running similarity_search_aggregated() (global ranking that
+  can displace named repos with higher-scoring irrelevant repos), we run
+  hybrid_search() filtered to each named repo individually, then build
+  the ranked_repos structure that the engine's _build_comparative_prompt()
+  expects. This guarantees the repos the user asked about always appear
+  in the comparison, with full chunk context.
 
 TOP-K VALUES:
   cross_repo_semantic  → per-repo (one chunk per repo, up to 10 repos)
+  cross_repo_comparative (named) → 3 chunks per named repo via hybrid_search
+  cross_repo_comparative (global) → top_repos=3, chunks_per_repo=3 via aggregation
   repo_specific        → 5 final chunks after re-rank + dedup
                          (fetches 20 raw via hybrid, re-ranks all 20,
                          deduplicates down to 5)
@@ -96,11 +109,9 @@ from indexer.deeplake_store import (hybrid_search,
 # Constants
 # ---------------------------------------------------------------------------
 
-TOP_K_REPO_SPECIFIC  = 5    # final chunks returned per turn in a deep dive
-TOP_K_HYBRID_FETCH   = 20   # raw candidates fetched before re-rank + dedup
-                             # wider than pure cosine (was 10) because hybrid
-                             # scoring changes rank ordering significantly,
-                             # and re-ranker needs headroom to promote chunks
+TOP_K_REPO_SPECIFIC        = 5    # final chunks returned per turn in a deep dive
+TOP_K_HYBRID_FETCH         = 20   # raw candidates fetched before re-rank + dedup
+TOP_K_COMPARATIVE_PER_REPO = 3    # chunks fetched per named repo in comparative
 
 SEEN_CHUNK_MAXLEN    = 40   # FIX 7: cap on seen_chunk_ids deque
                              # 5 chunks/turn × 8 turns = 40
@@ -108,10 +119,8 @@ SEEN_CHUNK_MAXLEN    = 40   # FIX 7: cap on seen_chunk_ids deque
 
 
 # ---------------------------------------------------------------------------
-# Re-ranker (FIX 4)
+# Re-ranker (FIX 4 — Jina API)
 # ---------------------------------------------------------------------------
-
-
 
 def _rerank(query: str, chunks: list[dict]) -> list[dict]:
     """Re-rank chunks using the hosted Jina API while preserving existing logic."""
@@ -145,6 +154,7 @@ def _rerank(query: str, chunks: list[dict]) -> list[dict]:
     except Exception as exc:
         print(f"  [retriever] Jina rerank failed ({exc}); using hybrid ranking.")
         return chunks
+
 
 # ---------------------------------------------------------------------------
 # Query enrichment (repo-specific only)
@@ -239,20 +249,125 @@ def retrieve_cross_repo_metadata() -> list[dict]:
     return repos
 
 
-def retrieve_cross_repo_comparative(question: str) -> list[dict]:
+def retrieve_cross_repo_comparative(
+    question: str,
+    named_repos: Optional[list[str]] = None,
+) -> list[dict]:
     """
-    Rank repos fairly for comparative questions like "which has the best auth?".
+    Retrieve chunks for comparative questions.
 
-    Uses cosine-only aggregated search (similarity_search_aggregated) — the
-    aggregation logic (avg of top-3 chunk scores per repo) already handles the
-    fairness problem at the repo level. Hybrid search is applied at the chunk
-    level in retrieve_repo_specific; for cross-repo ranking, cosine aggregation
-    is the right tool.
+    Two modes depending on whether specific repos were named:
 
-    Returns list of repo result dicts from similarity_search_aggregated().
+    MODE 1 — named_repos is None (general comparison):
+      Runs similarity_search_aggregated() — global ranking by top-3 average
+      chunk score per repo. Fair across all indexed repos. The top 3 repos
+      by score are returned with their best 3 chunks each.
+
+    MODE 2 — named_repos provided (explicit comparison):
+      Bypasses global ranking entirely. For each named repo, runs
+      hybrid_search() filtered to that repo and takes the top
+      TOP_K_COMPARATIVE_PER_REPO (3) chunks. Builds the same ranked_repos
+      structure that _build_comparative_prompt() in engine.py expects, with
+      repo_rank assigned in the order the user named them (not by score).
+
+      WHY THIS IS BETTER FOR NAMED REPOS:
+        Global ranking scores ALL repos against the question. A repo that
+        happens to have many semantically adjacent chunks (but isn't one the
+        user named) can score higher and displace a named repo from the top 3.
+        Example: "compare CorpLaw-AI and Claim-Verification on database design"
+        → github-brain scored 0.546 and took the #2 slot, pushing CorpLaw-AI
+        (0.513) to #3 with only 3 weak chunks from lib/prompts.ts.
+        With named_repos mode, CorpLaw-AI is fetched directly and gets its
+        best 3 database-relevant chunks via hybrid_search — the schema file
+        scores high on BM25 for "database design".
+
+      CASING: named_repos comes from the router which preserves the user's
+      casing. The engine normalizes these against indexed repo names before
+      passing them here, so exact casing is guaranteed.
+
+    Parameters:
+        question     The user's natural language question.
+        named_repos  Optional list of repo names explicitly mentioned in the
+                     question. Provided by engine.py after case normalization.
+
+    Returns list of repo result dicts matching the structure expected by
+    _build_comparative_prompt() in engine.py:
+    [
+      {
+        "repo_name":         "CorpLaw-AI",
+        "repo_score":        0.031,       ← RRF score (named mode) or cosine avg (global)
+        "repo_rank":         1,
+        "chunks":            [...],
+        "repo_description":  "...",
+        "repo_technologies": [...],
+        "repo_purpose":      "...",
+        "repo_language":     "...",
+        "deployment_url":    "...",
+      },
+      ...
+    ]
     """
     q = question[:80] + "..." if len(question) > 80 else question
-    print(f"  [retriever] Cross-repo comparative search: '{q}'")
+
+    # -------------------------------------------------------------------
+    # MODE 2: Named repos — fetch directly, bypass global ranking
+    # -------------------------------------------------------------------
+    if named_repos:
+        print(f"  [retriever] Cross-repo comparative (named): {named_repos}")
+
+        query_vector = embed_query(question)
+        if query_vector is None:
+            print("  [retriever] Failed to embed query.")
+            return []
+
+        results = []
+        for rank, repo_name in enumerate(named_repos, start=1):
+            chunks = hybrid_search(
+                query_vector=query_vector,
+                query_text=question,
+                top_k=TOP_K_COMPARATIVE_PER_REPO,
+                repo_name=repo_name,
+            )
+
+            if not chunks:
+                print(f"  [retriever] No chunks found for named repo: {repo_name}")
+                # Still include the repo in results so Gemini knows it was requested
+                # but had no retrievable chunks — better than silently omitting it.
+                results.append({
+                    "repo_name":         repo_name,
+                    "repo_score":        0.0,
+                    "repo_rank":         rank,
+                    "chunks":            [],
+                    "repo_description":  None,
+                    "repo_technologies": [],
+                    "repo_purpose":      None,
+                    "repo_language":     None,
+                    "deployment_url":    None,
+                })
+                continue
+
+            # Pull repo-level metadata from the first chunk.
+            first = chunks[0]
+            results.append({
+                "repo_name":         repo_name,
+                "repo_score":        round(float(chunks[0].get("score", 0)), 4),
+                "repo_rank":         rank,
+                "chunks":            chunks,
+                "repo_description":  first.get("repo_description"),
+                "repo_technologies": first.get("repo_technologies", []),
+                "repo_purpose":      first.get("repo_purpose"),
+                "repo_language":     first.get("repo_language"),
+                "deployment_url":    first.get("deployment_url"),
+            })
+
+        print(f"  [retriever] Named comparative: fetched chunks for "
+              f"{sum(1 for r in results if r['chunks'])} / {len(named_repos)} repos.")
+        return results
+
+    # -------------------------------------------------------------------
+    # MODE 1: General comparison — global aggregated ranking
+    # -------------------------------------------------------------------
+    print(f"  [retriever] Cross-repo comparative (global): '{q}'")
 
     query_vector = embed_query(question)
     if query_vector is None:
@@ -314,7 +429,7 @@ def retrieve_repo_specific(
       2. Embed the enriched query (for cosine component of hybrid search)
       3. Run hybrid_search: BM25 + cosine + RRF, filtered to repo_name
          → returns TOP_K_HYBRID_FETCH (20) candidates
-      4. Re-rank all 20 candidates with the cross-encoder model
+      4. Re-rank all 20 candidates with the Jina rerank API
          → reorders by precise (query, chunk) relevance score
       5. Deduplicate against seen_chunk_ids (capped deque — FIX 7)
          → removes chunks already seen this session
@@ -356,7 +471,7 @@ def retrieve_repo_specific(
     if not raw:
         return []
 
-    # Step 4: Re-rank with cross-encoder.
+    # Step 4: Re-rank with Jina API.
     # The enriched query is used (not just the bare question) so the
     # re-ranker has the same conversational context as the embedding.
     reranked = _rerank(enriched, raw)

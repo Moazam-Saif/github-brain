@@ -41,6 +41,12 @@ QUERY TYPES:
                                     "which project handles errors most thoroughly?"
                                     "which of my repos is most production-ready?"
 
+                           When specific repos are named in the question, the
+                           route includes a "repos" list so the retriever fetches
+                           chunks only from those repos, not the global ranking.
+                           Example: "compare CorpLaw-AI and skillswap on auth"
+                           → {"type": "cross_repo_comparative", "repos": ["CorpLaw-AI", "skillswap"]}
+
   repo_specific          → question targets one specific repo, either by name
                            or because there is an active session for that repo
                            Handled by: vector search within that repo only,
@@ -110,6 +116,11 @@ cross_repo_comparative
     "which of my repos is most production-ready?"
     "which project has the cleanest code structure?"
     "compare how claimsense and skillswap handle database access"
+    "compare CorpLaw-AI and Claim-Verification-Automation on database design"
+
+  If the question explicitly names specific repos to compare, extract those
+  repo names into a "repos" list. If no specific repos are named (general
+  comparison across all repos), omit the "repos" field entirely.
 
 repo_specific
   Question targets one specific repo by name, OR there is an active repo
@@ -128,12 +139,15 @@ RULES:
   - cross_repo_metadata vs cross_repo_semantic:
       metadata = answerable from tech stack / description / deployment info
       semantic = requires reading actual implementation code
+  - cross_repo_comparative with named repos: include "repos" list with the
+    exact repo names as mentioned in the question (preserve casing as given)
 
 Return exactly one of:
   {{"type": "list_repos"}}
   {{"type": "cross_repo_metadata"}}
   {{"type": "cross_repo_semantic"}}
   {{"type": "cross_repo_comparative"}}
+  {{"type": "cross_repo_comparative", "repos": ["RepoA", "RepoB"]}}
   {{"type": "repo_specific", "repo": "<name>"}}"""
 
 
@@ -158,7 +172,12 @@ def classify_question(
         {"type": "cross_repo_metadata"}
         {"type": "cross_repo_semantic"}
         {"type": "cross_repo_comparative"}
+        {"type": "cross_repo_comparative", "repos": ["CorpLaw-AI", "skillswap"]}
         {"type": "repo_specific", "repo": "claimsense"}
+
+    For cross_repo_comparative, "repos" is present only when the question
+    explicitly names specific repos to compare. When present, the retriever
+    fetches chunks only from those repos rather than running a global ranking.
 
     Falls back to {"type": "cross_repo_semantic"} on failure.
     """
@@ -194,6 +213,19 @@ def classify_question(
                 print("  [router] repo_specific but no repo name. "
                       "Falling back to cross_repo_semantic.")
                 return {"type": "cross_repo_semantic"}
+
+            # Normalize the repos list for cross_repo_comparative if present.
+            if parsed["type"] == "cross_repo_comparative":
+                repos = parsed.get("repos")
+                if repos is not None:
+                    if not isinstance(repos, list) or len(repos) == 0:
+                        # Malformed — treat as no filter
+                        parsed.pop("repos", None)
+                    else:
+                        # Keep only string entries, drop anything else
+                        parsed["repos"] = [r for r in repos if isinstance(r, str)]
+                        if not parsed["repos"]:
+                            parsed.pop("repos", None)
 
             return parsed
 
