@@ -1,0 +1,22 @@
+[33m671be38[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m ..
+[33m998e2e5[m fixed session persistence issue
+[33md43ff16[m fixed ranking in cross-repo comparisons
+[33mb093996[m using jina api instead of locally
+[33m009a4a5[m re-ranker adjustment
+[33maf6a717[m changed re-ranking model
+[33m7a7c449[m applied 8 total fixes (described in blueprint).
+[33m72fc659[m implementing hybrid bm-25 ranking to ensure proper code retrieval
+[33m5fe48e7[m fixed deeplake indexing error
+[33mc62ff6f[m debugging
+[33m0cb0f8a[m changed the retrieval strategy
+[33m0714eb8[m fixed case match issue
+[33m3cb50ba[m improving the retrieval strategy
+[33m80071a5[m fixed indexing issues
+[33mc4ae267[m fixed deeplake issues
+[33m4422dc2[m fixed type error
+[33m53a82bc[m fixed the prompt with better constraints
+[33m8e276b1[m fixing embedding issue
+[33md72517f[m tested connections and fixed issues
+[33ma5c18f9[m changes in gemini access approach
+[33m4002f79[m git ignore update
+[33m6ce68f1[m setting up the necessary files for the project
