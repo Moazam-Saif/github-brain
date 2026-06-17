@@ -77,6 +77,7 @@ No explanation, no markdown, no backticks.
 
 Question: "{question}"
 Active repo (if user is currently exploring one): {active_repo}
+Active comparison (if the user just compared specific repos, these are the repos — if this question is a follow-up that doesn't name different repos, assume it's still about these): {active_comparison}
 
 TYPES:
 
@@ -122,6 +123,16 @@ cross_repo_comparative
   repo names into a "repos" list. If no specific repos are named (general
   comparison across all repos), omit the "repos" field entirely.
 
+  FOLLOW-UP ON AN ACTIVE COMPARISON: if active_comparison is set (not "none")
+  and this question does NOT name different repos — e.g. "what about the
+  UI?", "and error handling?", "which one is better at X?" — classify as
+  cross_repo_comparative and reuse the SAME repos from active_comparison in
+  "repos". Only use different repos if the question explicitly names them
+  instead.
+  Example: active_comparison = "CorpLaw-AI, Claim-Verification-Automation"
+           question = "and what about user interface"
+  → {{"type": "cross_repo_comparative", "repos": ["CorpLaw-AI", "Claim-Verification-Automation"]}}
+
 repo_specific
   Question targets one specific repo by name, OR there is an active repo
   and the question is a follow-up that doesn't name a different repo.
@@ -141,6 +152,15 @@ RULES:
       semantic = requires reading actual implementation code
   - cross_repo_comparative with named repos: include "repos" list with the
     exact repo names as mentioned in the question (preserve casing as given)
+  - If active_comparison is set (not "none") and the question is a follow-up
+    that does NOT name different repos: classify as cross_repo_comparative
+    and set "repos" to the SAME repos listed in active_comparison
+  - If active_comparison is set but the question explicitly names NEW/
+    different repos to compare instead: use those new repos in "repos",
+    ignore active_comparison
+  - If active_comparison is set but the question targets ONE specific repo
+    from that comparison by name (e.g. "tell me more about CorpLaw-AI"):
+    classify as repo_specific with that repo name, NOT comparative
 
 Return exactly one of:
   {{"type": "list_repos"}}
@@ -158,14 +178,21 @@ Return exactly one of:
 def classify_question(
     question: str,
     active_repo: Optional[str] = None,
+    active_comparison: Optional[list[str]] = None,
     max_retries: int = 3,
 ) -> dict:
     """
     Classify a user question into one of five query types.
 
     Parameters:
-        question     Raw user question string.
-        active_repo  Currently active repo name from session, or None.
+        question           Raw user question string.
+        active_repo         Currently active repo name from session, or None.
+        active_comparison   List of repo names from the most recent
+                            cross_repo_comparative session (session["comparison_repos"]
+                            in engine.py), or None. Lets the router classify
+                            follow-ups like "what about the UI?" as a
+                            continuation of the SAME comparison rather than
+                            a fresh global search across all repos.
 
     Returns one of:
         {"type": "list_repos"}
@@ -175,9 +202,9 @@ def classify_question(
         {"type": "cross_repo_comparative", "repos": ["CorpLaw-AI", "skillswap"]}
         {"type": "repo_specific", "repo": "claimsense"}
 
-    For cross_repo_comparative, "repos" is present only when the question
-    explicitly names specific repos to compare. When present, the retriever
-    fetches chunks only from those repos rather than running a global ranking.
+    For cross_repo_comparative, "repos" is present when the question
+    explicitly names specific repos OR when it's a follow-up on an active
+    comparison (in which case "repos" carries over from active_comparison).
 
     Falls back to {"type": "cross_repo_semantic"} on failure.
     """
@@ -185,6 +212,7 @@ def classify_question(
     prompt = ROUTER_PROMPT.format(
         question=question,
         active_repo=active_repo if active_repo else "none",
+        active_comparison=", ".join(active_comparison) if active_comparison else "none",
     )
 
     valid_types = {"list_repos", "cross_repo_metadata",

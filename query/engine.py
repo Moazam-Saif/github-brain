@@ -107,6 +107,36 @@ def _new_session(repo_name: str, repo_metadata: dict, all_repos_cache: list) -> 
     }
 
 
+def _new_comparison_session(
+    comparison_repos: list[str],
+    all_repos_cache: list,
+) -> dict:
+    """
+    Create a session for a cross_repo_comparative exchange.
+
+    Structurally distinct from a repo_specific session — "active_repo" stays
+    None, so repo_specific code (which checks session["active_repo"]) never
+    mistakes this for a repo deep-dive. "comparison_repos" records which
+    repos were just compared, in case a follow-up needs that context.
+
+    NOTE: query() reads session["comparison_repos"] and passes it to
+    classify_question() as active_comparison, so a follow-up like "what
+    about the UI?" is correctly routed back to these SAME repos. However,
+    comparison_history is reset fresh on every comparative turn right now
+    (see the caller) — prior Q&A within the same comparison is NOT currently
+    carried into _build_comparative_prompt(), so Gemini won't see what was
+    already said about e.g. database design when answering a UI follow-up.
+    That's a separate, not-yet-made change if continuity of content (not
+    just correct routing) is needed.
+    """
+    return {
+        "active_repo":         None,              # never set — distinguishes from repo_specific
+        "comparison_repos":    comparison_repos,   # repos just compared
+        "comparison_history":  [],                 # filled in by the caller after this returns
+        "all_repos_cache":     all_repos_cache,     # FIX 2 pattern: cached repo list, reused
+    }
+
+
 def _normalize_repo_names(
     names: list[str],
     all_repos: list[dict],
@@ -449,8 +479,19 @@ def query(
     client      = get_client()
     active_repo = session["active_repo"] if session else None
 
+    # Pull comparison_repos from the session (set by _new_comparison_session
+    # on the previous turn, if the last question was cross_repo_comparative).
+    # Passed to the router as active_comparison so a follow-up like "what
+    # about the UI?" is classified as a continuation of the SAME comparison
+    # instead of a fresh global search.
+    active_comparison = session.get("comparison_repos") if session else None
+
     print(f"\n[engine] Question: '{question}'")
-    route      = classify_question(question, active_repo=active_repo)
+    route      = classify_question(
+        question,
+        active_repo=active_repo,
+        active_comparison=active_comparison,
+    )
     query_type = route["type"]
     print(f"[engine] Routed as: {route}")
 
@@ -537,7 +578,32 @@ def query(
             )
         prompt = _build_comparative_prompt(question, ranked_repos)
         answer = _generate_answer(prompt, client)
-        return answer, None
+
+        # Build a comparison session so the repos just compared are recorded.
+        # Uses named_repos if the router named specific repos; otherwise falls
+        # back to whichever repos the global ranking actually returned, so the
+        # session always reflects the repos this answer was actually about.
+        comparison_repos_for_session = (
+            named_repos if named_repos
+            else [r["repo_name"] for r in ranked_repos]
+        )
+        # all_repos_for_cmp was already fetched above when raw_named was set;
+        # if it wasn't (global comparison, no names given), fetch it now so
+        # the session's all_repos_cache is populated either way.
+        cache_for_session = (
+            all_repos_for_cmp if raw_named and all_repos_for_cmp
+            else list_all_repos()
+        )
+
+        new_session = _new_comparison_session(
+            comparison_repos_for_session,
+            cache_for_session,
+        )
+        new_session["comparison_history"] = [
+            {"role": "user",      "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+        return answer, new_session
 
     # -----------------------------------------------------------------------
     # repo_specific — deep dive with session management
