@@ -107,6 +107,56 @@ def _new_session(repo_name: str, repo_metadata: dict, all_repos_cache: list) -> 
     }
 
 
+def _normalize_repo_names(
+    names: list[str],
+    all_repos: list[dict],
+) -> list[str]:
+    """
+    Normalize a list of repo names (from the router) against the exact
+    casing of indexed repos.
+
+    THE BUG THIS FIXES: the router correctly extracts repo names from the
+    question (e.g. "compare CorpLaw-AI and Claim-Verification-Automation on
+    database design" → repos: ["CorpLaw-AI", "Claim-Verification-Automation"]),
+    but if this list is never passed down to retrieve_cross_repo_comparative(),
+    the retriever has no way to know specific repos were named and falls back
+    to similarity_search_aggregated() — a GLOBAL ranking across all indexed
+    repos. That's how an unrelated repo (e.g. github-brain) can outscore one
+    of the actually-named repos and take a slot in the comparison.
+
+    This function ensures the names extracted by the router match the EXACT
+    casing stored in the index (the router may return "Corplaw-AI" while the
+    index has "CorpLaw-AI"), so the named-repo filter in the retriever works
+    correctly instead of silently matching nothing.
+
+    Names that don't match any indexed repo are logged and dropped rather
+    than silently passed through (which would cause hybrid_search to filter
+    a nonexistent repo_name and return zero chunks for that slot).
+
+    Parameters:
+        names      List of repo name strings from route["repos"].
+        all_repos  Full list of indexed repo dicts from list_all_repos().
+
+    Returns list of normalized repo name strings (may be shorter than input
+    if some names didn't match anything indexed).
+    """
+    normalized = []
+    for name in names:
+        match = next(
+            (r["repo_name"] for r in all_repos
+             if r["repo_name"].lower() == name.lower()),
+            None,
+        )
+        if match:
+            if match != name:
+                print(f"[engine] Normalized named repo: '{name}' → '{match}'")
+            normalized.append(match)
+        else:
+            print(f"[engine] WARNING: named repo '{name}' not found in index. "
+                  f"Available: {[r['repo_name'] for r in all_repos]}")
+    return normalized
+
+
 def _manage_context_window(session: dict, client) -> dict:
     """
     Enforce the sliding window on conversation history.
@@ -448,7 +498,36 @@ def query(
     # cross_repo_comparative
     # -----------------------------------------------------------------------
     if query_type == "cross_repo_comparative":
-        ranked_repos = retrieve_cross_repo_comparative(question)
+        # THE FIX: the router already extracts named repos into route["repos"]
+        # (visible in the logs: {'type': 'cross_repo_comparative', 'repos':
+        # ['CorpLaw-AI', 'Claim-Verification-Automation']}) but this branch was
+        # discarding that field entirely and calling retrieve_cross_repo_comparative
+        # with ONLY the question — which forces the retriever into its global
+        # ranking fallback (no named_repos = no filter = searches ALL 21 repos,
+        # letting unrelated repos like github-brain outscore the ones actually
+        # asked about).
+        #
+        # Fix: extract route.get("repos"), normalize casing against the index,
+        # and pass the result as named_repos= so retrieve_cross_repo_comparative
+        # takes its MODE 2 path — fetching and ranking ONLY the named repos.
+        raw_named   = route.get("repos")
+        named_repos = None
+
+        if raw_named:
+            all_repos_for_cmp = list_all_repos()
+            if all_repos_for_cmp:
+                named_repos = _normalize_repo_names(raw_named, all_repos_for_cmp)
+                if not named_repos:
+                    print("[engine] All named repos failed normalization. "
+                          "Falling back to global ranking.")
+            else:
+                print("[engine] WARNING: list_all_repos() returned empty during "
+                      "comparative. Falling back to global ranking.")
+
+        ranked_repos = retrieve_cross_repo_comparative(
+            question,
+            named_repos=named_repos,   # None → global ranking, list → ONLY these repos
+        )
         if not ranked_repos:
             return (
                 "I couldn't find enough relevant code across your repos to "
