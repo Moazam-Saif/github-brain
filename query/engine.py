@@ -121,13 +121,11 @@ def _new_comparison_session(
 
     NOTE: query() reads session["comparison_repos"] and passes it to
     classify_question() as active_comparison, so a follow-up like "what
-    about the UI?" is correctly routed back to these SAME repos. However,
-    comparison_history is reset fresh on every comparative turn right now
-    (see the caller) — prior Q&A within the same comparison is NOT currently
-    carried into _build_comparative_prompt(), so Gemini won't see what was
-    already said about e.g. database design when answering a UI follow-up.
-    That's a separate, not-yet-made change if continuity of content (not
-    just correct routing) is needed.
+    about the UI?" is correctly routed back to these SAME repos. The caller
+    in query() also reads session["comparison_history"] when the follow-up
+    targets the same repo set, and passes it into _build_comparative_prompt()
+    so Gemini has continuity with what was already discussed in this
+    comparison rather than starting fresh every turn.
     """
     return {
         "active_repo":         None,              # never set — distinguishes from repo_specific
@@ -314,8 +312,22 @@ Retrieved code context:
 {chunks_text}"""
 
 
-def _build_comparative_prompt(question: str, ranked_repos: list[dict]) -> str:
-    """Prompt for cross_repo_comparative questions."""
+def _build_comparative_prompt(
+    question: str,
+    ranked_repos: list[dict],
+    comparison_history: Optional[list[dict]] = None,
+) -> str:
+    """
+    Prompt for cross_repo_comparative questions.
+
+    comparison_history (optional): prior Q&A turns from THIS SAME comparison
+    session (e.g. the database-design answer when this turn asks about the
+    UI instead). When provided, it's rendered above the current question so
+    Gemini has continuity — knows what was already said about these same two
+    repos and doesn't need to be told again, can reference it, and won't
+    contradict itself. Defaults to None for the first turn of a comparison,
+    where there's nothing to include yet.
+    """
     sections = []
     for repo in ranked_repos:
         chunks_text = "\n\n".join(
@@ -337,6 +349,18 @@ def _build_comparative_prompt(question: str, ranked_repos: list[dict]) -> str:
 
     repos_text = "\n\n".join(sections) if sections else "No repos found."
 
+    # Render prior turns in this comparison, if any.
+    history_block = ""
+    if comparison_history:
+        history_lines = "\n\n".join(
+            f"{turn['role'].capitalize()}: {turn['content']}"
+            for turn in comparison_history
+        )
+        history_block = (
+            f"\nEarlier in this comparison:\n{history_lines}\n"
+            f"\nDon't repeat what was already covered above — focus on the new question.\n"
+        )
+
     return f"""You are GitHub Brain, an assistant that helps a developer understand their GitHub repositories.
 
 The developer is asking a comparative question about their repos.
@@ -346,7 +370,7 @@ along with their most relevant code chunks.
 Compare these repos honestly based on the code shown. Reference specific file paths,
 function names, and implementation details. If one repo clearly does something better,
 say so and explain why. If they're comparable, say that too.
-
+{history_block}
 Question: {question}
 
 Ranked repositories (by topic relevance):
@@ -565,6 +589,23 @@ def query(
                 print("[engine] WARNING: list_all_repos() returned empty during "
                       "comparative. Falling back to global ranking.")
 
+        # Is this a follow-up on an EXISTING comparison session, talking
+        # about the SAME repos? If so, pull its prior history so the prompt
+        # has continuity instead of starting from scratch every turn.
+        # Compared as sets so repo order/casing differences don't break the
+        # match (named_repos is already normalized; session repos were too).
+        prior_history = []
+        is_followup = bool(
+            session
+            and session.get("comparison_repos")
+            and named_repos
+            and set(session["comparison_repos"]) == set(named_repos)
+        )
+        if is_followup:
+            prior_history = session.get("comparison_history", [])
+            print(f"[engine] Continuing comparison session: {named_repos} "
+                  f"({len(prior_history)} prior turns)")
+
         ranked_repos = retrieve_cross_repo_comparative(
             question,
             named_repos=named_repos,   # None → global ranking, list → ONLY these repos
@@ -574,9 +615,13 @@ def query(
                 "I couldn't find enough relevant code across your repos to "
                 "make a comparison. Make sure your repos are indexed with "
                 "`python cli.py index --mode full`.",
-                None,
+                session if is_followup else None,
             )
-        prompt = _build_comparative_prompt(question, ranked_repos)
+        prompt = _build_comparative_prompt(
+            question,
+            ranked_repos,
+            comparison_history=prior_history,
+        )
         answer = _generate_answer(prompt, client)
 
         # Build a comparison session so the repos just compared are recorded.
@@ -599,7 +644,10 @@ def query(
             comparison_repos_for_session,
             cache_for_session,
         )
-        new_session["comparison_history"] = [
+        # Extend prior history on a follow-up turn instead of discarding it.
+        # prior_history is [] on the first turn of a comparison (is_followup
+        # was False), so this naturally degrades to "just this turn" then.
+        new_session["comparison_history"] = prior_history + [
             {"role": "user",      "content": question},
             {"role": "assistant", "content": answer},
         ]
