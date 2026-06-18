@@ -86,25 +86,55 @@ list_repos
   Examples: "what repos do I have?", "show me my projects", "how many repos?"
 
 cross_repo_metadata
-  Question asks about a technology, language, deployment status, or project
-  category answerable by checking stored metadata — WITHOUT reading source code.
-  Metadata contains: repo name, description, technologies list, purpose,
-  primary language, deployment URL, topics.
+  Question asks about ANY attribute that is already extracted and stored as
+  metadata at index time — WITHOUT needing to read source code. This is a much
+  broader set than just "technology/language/deployment". The stored metadata
+  fields are:
+    repo_name, repo_description, repo_technologies, repo_purpose,
+    repo_language, deployment_url, repo_topics,
+    has_authentication (bool), has_database (bool), database_type,
+    has_api (bool), api_style, has_frontend (bool), frontend_framework,
+    architecture_pattern, key_features (list), external_services (list),
+    has_tests (bool)
+  If the question can be answered by checking ANY of these fields directly —
+  even if the question is phrased as "does X exist" or "do any repos do Y" —
+  it is cross_repo_metadata, NOT cross_repo_semantic. This includes questions
+  about authentication, databases, APIs, frontend frameworks, testing,
+  external services (Redis, Stripe, etc.), and architecture patterns, because
+  ALL of these are already booleans/fields in metadata — the system never
+  needs to read code to answer them.
   Examples:
-    "do I have anything using Redis?"
-    "which repos are deployed?"
-    "do I have any Java projects?"
-    "which projects use Docker?"
-    "what languages do I use across my repos?"
+    "do I have anything using Redis?"            → external_services
+    "which repos are deployed?"                  → deployment_url
+    "do I have any Java projects?"                → repo_language
+    "which projects use Docker?"                  → repo_technologies / external_services
+    "what languages do I use across my repos?"    → repo_language
+    "do any of my repos use authentication?"      → has_authentication
+    "which repos have a database?"                → has_database
+    "do any repos have tests?"                     → has_tests
+    "which projects have a REST API?"              → has_api / api_style
+    "do any of my repos use Redis for caching?"    → external_services
+      (the "for caching" phrase does NOT change this — it's still asking
+      "is Redis used anywhere", which is a metadata lookup, not a request
+      to read caching implementation code)
 
 cross_repo_semantic
-  Question asks whether a concept, pattern, or feature EXISTS anywhere across
-  repos — requires reading actual source code, but does NOT rank or compare repos.
-  The answer is find/not-find, not a ranking.
+  Question asks about HOW a concept/pattern is implemented, or about a
+  specific code-level detail that is NOT one of the stored metadata fields
+  above. Requires reading actual source code. The answer is find/not-find
+  or "how", not a ranking, and NOT something coverable by has_authentication/
+  has_database/has_api/has_frontend/has_tests/external_services/etc.
   Examples:
-    "do any of my repos implement rate limiting?"
-    "do I have anything using WebSockets?"
-    "which repos handle file uploads?"
+    "do any of my repos implement rate limiting?"   (no has_rate_limiting field)
+    "do I have anything using WebSockets?"           (no has_websockets field)
+    "which repos handle file uploads?"                (no has_file_upload field)
+    "which repos validate JWT signatures manually?"   (implementation detail,
+                                                        not just "has auth")
+  RULE OF THUMB: if a yes/no metadata field already exists for the concept
+  (see the list above), use cross_repo_metadata even if it's phrased as
+  "do any repos do X" or "which repos use X for Y". Only use cross_repo_semantic
+  when the concept has NO corresponding stored field and genuinely requires
+  reading code to answer.
 
 cross_repo_comparative
   Question RANKS or COMPARES repos against each other on some quality or
@@ -147,9 +177,21 @@ RULES:
   - cross_repo_comparative vs cross_repo_semantic:
       comparative = user wants a ranking/winner/comparison
       semantic    = user wants to find IF something exists
-  - cross_repo_metadata vs cross_repo_semantic:
-      metadata = answerable from tech stack / description / deployment info
-      semantic = requires reading actual implementation code
+  - cross_repo_metadata vs cross_repo_semantic — USE THIS EXACT TEST:
+      Does a stored metadata field directly answer this? Check this list:
+      has_authentication, has_database, database_type, has_api, api_style,
+      has_frontend, frontend_framework, architecture_pattern, key_features,
+      external_services, has_tests, repo_technologies, repo_language,
+      deployment_url, repo_topics, repo_purpose.
+      → YES, a field covers it: cross_repo_metadata. ALWAYS, even if phrased
+        as "do any repos do X", "does X exist", or "which repos use X for Y".
+      → NO field covers it (the concept needs reading actual code to verify,
+        e.g. rate limiting, WebSockets, file uploads, specific algorithms):
+        cross_repo_semantic.
+      Do NOT default to semantic just because the question uses "do any/does
+      X exist" phrasing — that phrasing is used by BOTH types. The deciding
+      factor is ALWAYS whether a metadata field exists for the concept, not
+      the question's grammar.
   - cross_repo_comparative with named repos: include "repos" list with the
     exact repo names as mentioned in the question (preserve casing as given)
   - If active_comparison is set (not "none") and the question is a follow-up
