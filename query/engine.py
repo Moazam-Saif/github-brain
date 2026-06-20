@@ -135,6 +135,44 @@ def _new_comparison_session(
     }
 
 
+def _new_context_session(question: str, answer: str) -> dict:
+    """
+    Create a minimal session after a list_repos, cross_repo_metadata, or
+    cross_repo_semantic answer, so the NEXT turn has cross-turn context.
+
+    THE PROBLEM THIS FIXES:
+      These three query types previously returned session=None, discarding
+      the just-answered exchange entirely. If the next turn was repo_specific
+      (e.g. "tell me how Encrypted-Virtual-Drive applies it"), the session
+      started fresh with empty conversation_history. The enriched query was
+      built from that empty history — so "it" had no referent, and the
+      embedding searched for "how Encrypted-Virtual-Drive applies it" with
+      no idea what "it" meant. The retriever found generic tech-stack chunks
+      instead of authentication-specific ones.
+
+    THE FIX:
+      Return a lightweight session carrying just the prior Q&A in
+      prior_exchange. When the next turn starts a repo_specific session
+      (_new_session), the repo_specific branch checks for prior_exchange and
+      seeds conversation_history with it before the first retrieval call.
+      _build_enriched_query() then sees the prior exchange as context and
+      resolves pronouns/references correctly.
+
+    This session carries no active_repo, no comparison_repos — it's purely
+    a cross-turn context bridge. The repo_specific branch already handles the
+    case where active_repo is None (starts a new session), so nothing else
+    in the codebase needs to change.
+    """
+    return {
+        "active_repo":      None,
+        "comparison_repos": None,
+        "prior_exchange":   [
+            {"role": "user",      "content": question},
+            {"role": "assistant", "content": answer[:300] + "..." if len(answer) > 300 else answer},
+        ],
+    }
+
+
 def _normalize_repo_names(
     names: list[str],
     all_repos: list[dict],
@@ -526,7 +564,7 @@ def query(
         repos  = list_all_repos()
         prompt = _build_metadata_prompt(question, repos)
         answer = _generate_answer(prompt, client)
-        return answer, None
+        return answer, _new_context_session(question, answer)
 
     # -----------------------------------------------------------------------
     # cross_repo_metadata
@@ -541,7 +579,7 @@ def query(
             )
         prompt = _build_metadata_prompt(question, repos)
         answer = _generate_answer(prompt, client)
-        return answer, None
+        return answer, _new_context_session(question, answer)
 
     # -----------------------------------------------------------------------
     # cross_repo_semantic
@@ -557,7 +595,7 @@ def query(
             )
         prompt = _build_semantic_prompt(question, chunks)
         answer = _generate_answer(prompt, client)
-        return answer, None
+        return answer, _new_context_session(question, answer)
 
     # -----------------------------------------------------------------------
     # cross_repo_comparative
@@ -582,6 +620,30 @@ def query(
             all_repos_for_cmp = list_all_repos()
             if all_repos_for_cmp:
                 named_repos = _normalize_repo_names(raw_named, all_repos_for_cmp)
+
+                # FIX 13: detect a PARTIAL match — some names matched, some
+                # didn't (e.g. "compare CorpLaw-AI and Claim-Verification-AI"
+                # where the second is a typo for Claim-Verification-Automation).
+                # Previously this silently proceeded with just the matched
+                # repo(s), producing a confusing answer that looks like a
+                # comparison but is actually only describing one repo, with
+                # no indication to the user that a name was dropped.
+                if named_repos and len(named_repos) < len(raw_named):
+                    unmatched = [
+                        n for n in raw_named
+                        if n.lower() not in {m.lower() for m in named_repos}
+                    ]
+                    available = [r["repo_name"] for r in all_repos_for_cmp]
+                    print(f"[engine] WARNING: partial named-repo match. "
+                          f"Matched: {named_repos}, unmatched: {unmatched}")
+                    return (
+                        f"I couldn't find a repo named "
+                        f"'{', '.join(unmatched)}' in your indexed repos, so I "
+                        f"can't run this comparison. Your indexed repos are: "
+                        f"{', '.join(available)}. Check the spelling and try again.",
+                        session,   # preserve whatever session existed — don't wipe it
+                    )
+
                 if not named_repos:
                     print("[engine] All named repos failed normalization. "
                           "Falling back to global ranking.")
@@ -688,11 +750,16 @@ def query(
         # FIX 6: Explicit warning — don't silently create a broken session.
         print(f"[engine] WARNING: repo '{repo_name}' from router not found in "
               f"indexed repos. Available: {[r['repo_name'] for r in all_repos]}")
+        # FIX 12: preserve whatever session already existed instead of wiping
+        # it with None. A typo'd repo name on a follow-up question (e.g. user
+        # is mid-conversation about CorpLaw-AI and asks about a misspelled
+        # repo) should fail THIS turn only — not destroy the active session.
+        # The user can correct the name and continue where they left off.
         return (
             f"I couldn't find a repo named '{repo_name}' in your indexed repos. "
             f"Try asking about one of your indexed repos by its exact name, or "
             f"run `python cli.py index --mode full` if you haven't indexed yet.",
-            None,
+            session,
         )
 
     if matched_repo["repo_name"] != repo_name:
@@ -702,7 +769,19 @@ def query(
     # Start new session or continue existing one.
     # Normalization above guarantees repo_name casing matches session["active_repo"].
     if session is None or session.get("active_repo") != repo_name:
+        # Capture prior_exchange BEFORE overwriting session — _new_session()
+        # returns a fresh dict and the incoming session reference is lost after.
+        prior_exchange = session.get("prior_exchange", []) if session else []
         session = _new_session(repo_name, matched_repo, all_repos)
+        # If the previous turn was a metadata/semantic/list answer, it left a
+        # prior_exchange in the session. Seed conversation_history with it so
+        # _build_enriched_query() can resolve pronouns and references (e.g.
+        # "tell me how Encrypted-Virtual-Drive applies IT" → "it" = authentication
+        # from the prior metadata answer). Already truncated to 300 chars in
+        # _new_context_session() so it doesn't bloat the enriched query.
+        if prior_exchange:
+            session["conversation_history"] = prior_exchange
+            print(f"[engine] Seeded session with prior context ({len(prior_exchange)} turns)")
         print(f"[engine] New session: {repo_name}")
     else:
         print(f"[engine] Continuing session: {repo_name}")
