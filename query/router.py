@@ -137,17 +137,33 @@ cross_repo_semantic
   reading code to answer.
 
 cross_repo_comparative
-  Question RANKS or COMPARES repos against each other on some quality or
-  implementation. The answer is a ranking or winner, not just find/not-find.
-  These CANNOT be answered by metadata alone and require reading code from
-  multiple repos fairly.
-  Examples:
-    "which repo has the best authentication?"
-    "which project handles errors most thoroughly?"
-    "which of my repos is most production-ready?"
+  Question RANKS or COMPARES repos against each other, AND the ranking
+  criterion requires reading actual implementation code to evaluate — it
+  cannot be answered from metadata fields alone.
+
+  DECISION GATE — apply this test before choosing this type:
+    Ask: can the ranking/comparison criterion be evaluated using only the
+    stored metadata fields (repo_purpose, repo_technologies, key_features,
+    repo_description, repo_language, architecture_pattern, etc.)?
+    → YES, metadata is enough: use cross_repo_metadata instead.
+    → NO, you must read implementation code to judge: use cross_repo_comparative.
+
+  Code-quality criteria that require reading code (→ cross_repo_comparative):
+    "which repo has the best authentication?"      (need to read auth code)
+    "which project handles errors most thoroughly?" (need to read error handling)
+    "which of my repos is most production-ready?"  (need to read code quality)
     "which project has the cleanest code structure?"
     "compare how claimsense and skillswap handle database access"
     "compare CorpLaw-AI and Claim-Verification-Automation on database design"
+
+  Identity/relevance criteria answerable from metadata (→ cross_repo_metadata):
+    "which repo is most relevant for an AI engineering role?"
+    "suggest my best project for a portfolio"
+    "which of my repos is most impressive for a backend interview?"
+    "which project best demonstrates my Python skills?"
+    These ask WHAT the repo IS (its purpose, stack, domain) — answerable
+    from repo_purpose, repo_technologies, key_features, repo_description.
+    Route to cross_repo_metadata even though they sound like rankings.
 
   If the question explicitly names specific repos to compare, extract those
   repo names into a "repos" list. If no specific repos are named (general
@@ -174,6 +190,13 @@ repo_specific
 RULES:
   - If repo_specific: extract the repo name, or use active_repo if set
   - If repo_specific but no repo name and no active_repo: use cross_repo_semantic
+  - cross_repo_comparative vs cross_repo_metadata — USE THIS GATE FIRST:
+      Before routing to cross_repo_comparative, ask: does the comparison
+      criterion require reading implementation code, or is it answerable
+      from what the repo IS (purpose, stack, domain, description)?
+      → Answerable from metadata: cross_repo_metadata. ALWAYS. Even if
+        the question uses ranking words like "best", "most", "suggest".
+      → Requires reading code to judge quality/implementation: cross_repo_comparative.
   - cross_repo_comparative vs cross_repo_semantic:
       comparative = user wants a ranking/winner/comparison
       semantic    = user wants to find IF something exists

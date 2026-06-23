@@ -580,10 +580,29 @@ def similarity_search_aggregated(
     """
     Score repos as a whole for comparative questions ("which repo has the best auth?").
 
-    Uses cosine internally — the aggregation logic (avg of top-3 chunk scores
+    Uses cosine internally — the aggregation logic (avg of top-N chunk scores
     per repo) already addresses the fairness problem that hybrid search solves
     at the chunk level. Applying hybrid here would add BM25 cost with no
     additional benefit since repo ranking is by aggregate score, not precision.
+
+    SCORING LOGIC:
+      For each repo, sort its chunks by score descending, take up to TOP_N,
+      and average those scores. Two fixes vs. the original:
+
+      1. Sort before slicing: chunks arrive grouped from the global candidate
+         list, which is sorted globally but not within each repo. Without
+         sorting per-repo first, chunks[:TOP_N] takes the first 3 encountered
+         in the global order — potentially lower-scoring chunks — rather than
+         the actual best 3 for that repo.
+
+      2. Divide by len(top_n_chunks) not a hardcoded 3: a repo with only 1 or
+         2 chunks in the candidate pool (small repo, or thin pool) would
+         otherwise be penalized by dividing its real score by 3. Now it's
+         scored on however many chunks it has, minimum 1.
+
+    candidate_k should be scaled by the caller (retriever.py) proportionally
+    to the number of indexed repos so every repo gets a fair statistical share
+    of the pool. See CANDIDATE_K_PER_REPO in retriever.py.
 
     Returns list of repo result dicts sorted by repo_score descending.
     """
@@ -604,9 +623,16 @@ def similarity_search_aggregated(
     TOP_N = 3
     repo_scores = []
     for name, chunks in repo_chunks.items():
-        top_n_scores = [c["score"] for c in chunks[:TOP_N]]
-        repo_score   = sum(top_n_scores) / len(top_n_scores)
-        repo_scores.append((name, repo_score, chunks))
+        # FIX: sort by score descending within this repo before slicing.
+        # The global candidate list is sorted globally, not per-repo, so
+        # without this a lower-scoring chunk encountered first in the global
+        # order could displace a higher-scoring chunk from the top-N average.
+        sorted_chunks = sorted(chunks, key=lambda c: c["score"], reverse=True)
+        top_n_chunks  = sorted_chunks[:TOP_N]
+        # FIX: divide by actual count, not hardcoded 3 — avoids penalizing
+        # repos that have fewer than TOP_N chunks in the candidate pool.
+        repo_score    = sum(c["score"] for c in top_n_chunks) / len(top_n_chunks)
+        repo_scores.append((name, repo_score, sorted_chunks))
 
     repo_scores.sort(key=lambda x: x[1], reverse=True)
 

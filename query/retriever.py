@@ -113,6 +113,18 @@ TOP_K_REPO_SPECIFIC        = 5    # final chunks returned per turn in a deep div
 TOP_K_HYBRID_FETCH         = 20   # raw candidates fetched before re-rank + dedup
 TOP_K_COMPARATIVE_PER_REPO = 3    # chunks fetched per named repo in comparative
 
+# Candidate pool sizing for global comparative search.
+# With a fixed candidate_k=50 across 20 repos, the pool averages 2.5 chunks
+# per repo before grouping — not enough for a fair top-3 average per repo.
+# Fix: scale candidate_k with the number of indexed repos so every repo gets
+# a statistically fair number of shots at the pool.
+# CANDIDATE_K_PER_REPO × repo_count = pool size. 5 per repo means each repo
+# has ~5 chunks competing before grouping, which is enough margin for the
+# top-3 average to be meaningful. Minimum of 50 preserves the old behavior
+# when there are only a handful of repos.
+CANDIDATE_K_PER_REPO      = 5    # pool slots per repo for global comparative
+CANDIDATE_K_MIN           = 50   # floor — never fetch fewer than this
+
 SEEN_CHUNK_MAXLEN    = 40   # FIX 7: cap on seen_chunk_ids deque
                              # 5 chunks/turn × 8 turns = 40
                              # oldest entries evicted automatically when full
@@ -374,11 +386,21 @@ def retrieve_cross_repo_comparative(
         print("  [retriever] Failed to embed query.")
         return []
 
+    # Scale candidate_k with repo count so every repo gets a fair share of
+    # the pool. list_all_repos() is cheap (no vector search) and the result
+    # is already cached in the engine's session on subsequent turns, but
+    # here we call it directly because retrieve_cross_repo_comparative has
+    # no session access. In practice this is one extra metadata read, not
+    # a full Deep Lake reload, so the cost is negligible.
+    repo_count = len(list_all_repos())
+    candidate_k = max(CANDIDATE_K_MIN, repo_count * CANDIDATE_K_PER_REPO)
+    print(f"  [retriever] {repo_count} repos indexed → candidate_k={candidate_k}")
+
     results = similarity_search_aggregated(
         query_vector=query_vector,
         top_repos=3,
         chunks_per_repo=3,
-        candidate_k=50,
+        candidate_k=candidate_k,
     )
 
     print(f"  [retriever] Ranked {len(results)} repos for comparison.")
