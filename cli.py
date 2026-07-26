@@ -135,7 +135,7 @@ def cmd_chat(args):
         # Query.
         print(f"\n{SEPARATOR}")
         try:
-            answer, session = query(user_input, session=session)
+            answer, session, _ = query(user_input, session=session)
             _print_answer(answer)
         except Exception as e:
             print(f"\n{BOT_PREFIX}Something went wrong: {e}")
