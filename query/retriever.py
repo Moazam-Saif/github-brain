@@ -32,10 +32,29 @@ HOW IT WORKS:
     regardless of how they score globally.
 
   retrieve_repo_specific(question, repo_name, conversation_history, seen_chunk_ids)
-    Uses HYBRID SEARCH (BM25 + cosine via RRF) on the enriched query,
+    Uses HYBRID SEARCH (BM25 + cosine via RRF) on the enriched+HyDE query,
     filtered to the target repo, followed by CROSS-ENCODER RE-RANKING.
     This is the primary search path and the one that benefits most from
     both hybrid retrieval and re-ranking.
+
+QUERY REWRITING (_rewrite_for_retrieval):
+  Used by cross_repo_semantic and cross_repo_comparative before embedding.
+  Strips conversational framing ("do any of my repos", "which project",
+  "can you tell me") and returns only the core technical concept.
+  Closes the gap between how users phrase questions and how code is indexed.
+  Falls back to the original question if the rewrite is longer (expansion
+  detected) or if Gemini fails.
+
+HyDE — HYPOTHETICAL DOCUMENT EMBEDDINGS (_generate_hyde_query):
+  Used by retrieve_repo_specific before embedding.
+  Generates a short, plausible code snippet that WOULD answer the question,
+  then embeds that snippet instead of the natural language question.
+  Bridges the semantic gap between question-space and code-space — the
+  hypothetical snippet's vector aligns far better with indexed code chunk
+  vectors than a natural language question would.
+  Falls back to the enriched query if generation fails or produces prose.
+  The enriched query (not HyDE) is still used for Jina reranking, since
+  cross-encoders work better with natural language intent.
 
 FIX 4 — CROSS-ENCODER RE-RANKER:
   After hybrid_search returns 20 candidates, a cross-encoder model
@@ -103,6 +122,7 @@ from indexer.deeplake_store import (hybrid_search,
                                     similarity_search_per_repo,
                                     similarity_search_aggregated,
                                     list_all_repos)
+from gemini_client          import get_client, GEMINI_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +228,157 @@ def _build_enriched_query(question: str, conversation_history: list[dict]) -> st
 
 
 # ---------------------------------------------------------------------------
-# Chunk deduplication
+# Query rewriting (cross-repo paths)
 # ---------------------------------------------------------------------------
+
+def _rewrite_for_retrieval(question: str) -> str:
+    """
+    Strip conversational framing from a question to produce a dense,
+    retrieval-optimized query for embedding.
+
+    WHY: Embedding models compute cosine similarity between the query vector
+    and chunk vectors. Code chunks don't contain question framing — they
+    contain function names, variable names, comments, and logic. Phrases like
+    "do any of my repos", "can you tell me", "which project" add noise to the
+    query vector that pulls it away from the actual concept being searched.
+
+    WHAT THIS DOES:
+      Remove question structure, filler words, and ownership framing.
+      Keep only the core technical concept(s).
+      Do NOT add words that aren't implied by the question.
+
+    Examples:
+      "do any of my repos implement rate limiting?"
+        → "rate limiting"
+      "which repo has the best authentication flow?"
+        → "authentication flow"
+      "which of my projects uses Redis for caching?"
+        → "Redis caching"
+      "do I have anything that handles file uploads?"
+        → "file upload handling"
+      "which project has the most thorough error handling?"
+        → "error handling"
+
+    FALLBACK: if Gemini fails or returns something longer than the original
+    question (a sign it expanded rather than stripped), the original question
+    is used as-is. Bad rewrite is worse than no rewrite.
+
+    Used by: retrieve_cross_repo_semantic, retrieve_cross_repo_comparative
+    NOT used by: retrieve_repo_specific (which uses HyDE instead)
+    """
+    try:
+        client = get_client()
+        prompt = (
+            "Extract the core technical concept from this question as a short, "
+            "dense search phrase. Remove all question framing, conversational "
+            "words, and ownership references ('my repos', 'my projects', 'do I have', "
+            "'which project', 'can you', 'tell me'). Return ONLY the concept — "
+            "no explanation, no punctuation, no added words.\n\n"
+            f"Question: {question}\n"
+            "Core concept:"
+        )
+        response = get_client().models.generate_content(
+            model=GEMINI_MODEL, contents=prompt
+        )
+        rewritten = response.text.strip().strip('"').strip("'")
+        # Sanity check: rewrite must be shorter than the original.
+        # If Gemini expanded instead of stripped, discard it.
+        if rewritten and len(rewritten) < len(question):
+            print(f"  [retriever] Rewritten query: '{question[:60]}' → '{rewritten}'")
+            return rewritten
+        else:
+            print(f"  [retriever] Rewrite discarded (not shorter). Using original.")
+            return question
+    except Exception as e:
+        print(f"  [retriever] Query rewrite failed ({e}). Using original.")
+        return question
+
+
+# ---------------------------------------------------------------------------
+# HyDE — Hypothetical Document Embedding (repo-specific path)
+# ---------------------------------------------------------------------------
+
+def _generate_hyde_query(question: str, repo_name: str, enriched: str) -> str:
+    """
+    Generate a hypothetical code snippet that would answer the question,
+    then use that as the embedding query instead of the natural language question.
+
+    WHY (HyDE — Hypothetical Document Embeddings):
+      There is a fundamental semantic gap between a natural language question
+      and a code chunk. "How does this repo handle JWT authentication?" lives
+      in question-space; the actual indexed chunk lives in code-space:
+      function signatures, variable names, decorators, inline comments.
+      Embedding a question produces a vector that may not align well with
+      the vectors of the actual code chunks that answer it.
+
+      HyDE closes this gap: generate a plausible code snippet that WOULD
+      answer the question, then embed that. The resulting vector lives in
+      code-space and aligns far better with the indexed chunk vectors.
+      The hypothetical code doesn't need to be correct — it just needs to
+      use the right vocabulary (function names, patterns, keywords) so the
+      embedding lands near real chunks.
+
+    WHAT THIS GENERATES:
+      A short, plausible code snippet (5-15 lines) using realistic variable
+      and function names, in the likely language of the repo, that represents
+      what the implementation of the answer would look like.
+
+    RELATIONSHIP TO _build_enriched_query:
+      _build_enriched_query adds conversation history to resolve pronoun
+      references ("how does THAT work?" → prepend prior turns so the
+      embedding knows what "that" refers to). HyDE replaces the question
+      with a hypothetical code answer. These compose: the enriched query
+      (with history context) is passed into this function as `enriched`,
+      so HyDE generates a hypothetical snippet informed by the full
+      conversational context, not just the raw question.
+
+    FALLBACK: if generation fails or produces something that looks like
+    prose rather than code (no common code tokens detected), fall back
+    to the enriched query. A bad HyDE snippet would steer retrieval worse
+    than the enriched natural language query.
+
+    Parameters:
+        question   Raw current question (for the prompt instruction).
+        repo_name  Repo being searched (included in the prompt so Gemini
+                   can infer the likely language/framework).
+        enriched   Output of _build_enriched_query — history-enriched query.
+                   Used as context and as the fallback.
+
+    Returns the hypothetical code string, or `enriched` on failure.
+    """
+    CODE_TOKENS = {"def ", "function ", "class ", "return ", "const ", "=>",
+                   "import ", "from ", "async ", "await ", "if ", "for "}
+
+    try:
+        prompt = (
+            f"You are helping retrieve code from a repository called '{repo_name}'.\n"
+            f"Write a short, plausible code snippet (5-15 lines) that would implement "
+            f"the answer to this question. Use realistic function/variable names and "
+            f"patterns. The code doesn't need to be runnable — it just needs to use "
+            f"the right vocabulary so it can be matched against real code chunks.\n"
+            f"Return ONLY the code — no explanation, no markdown, no backticks.\n\n"
+            f"Context:\n{enriched}\n\n"
+            f"Question: {question}\n"
+            f"Hypothetical code snippet:"
+        )
+        response = get_client().models.generate_content(
+            model=GEMINI_MODEL, contents=prompt
+        )
+        hyde = response.text.strip().strip("`")
+
+        # Sanity check: must look like code, not a prose answer.
+        if hyde and any(token in hyde for token in CODE_TOKENS):
+            print(f"  [retriever] HyDE snippet generated ({len(hyde)} chars).")
+            return hyde
+        else:
+            print(f"  [retriever] HyDE output looks like prose — falling back to enriched query.")
+            return enriched
+    except Exception as e:
+        print(f"  [retriever] HyDE generation failed ({e}). Using enriched query.")
+        return enriched
+
+
+
 
 def _chunk_id(chunk: dict) -> str:
     """
@@ -327,7 +496,8 @@ def retrieve_cross_repo_comparative(
     if named_repos:
         print(f"  [retriever] Cross-repo comparative (named): {named_repos}")
 
-        query_vector = embed_query(question)
+        rewritten    = _rewrite_for_retrieval(question)
+        query_vector = embed_query(rewritten)
         if query_vector is None:
             print("  [retriever] Failed to embed query.")
             return []
@@ -336,7 +506,7 @@ def retrieve_cross_repo_comparative(
         for rank, repo_name in enumerate(named_repos, start=1):
             chunks = hybrid_search(
                 query_vector=query_vector,
-                query_text=question,
+                query_text=rewritten,
                 top_k=TOP_K_COMPARATIVE_PER_REPO,
                 repo_name=repo_name,
             )
@@ -381,20 +551,15 @@ def retrieve_cross_repo_comparative(
     # -------------------------------------------------------------------
     print(f"  [retriever] Cross-repo comparative (global): '{q}'")
 
-    query_vector = embed_query(question)
+    rewritten    = _rewrite_for_retrieval(question)
+    repo_count   = len(list_all_repos())
+    candidate_k  = max(CANDIDATE_K_MIN, repo_count * CANDIDATE_K_PER_REPO)
+    print(f"  [retriever] {repo_count} repos indexed → candidate_k={candidate_k}")
+
+    query_vector = embed_query(rewritten)
     if query_vector is None:
         print("  [retriever] Failed to embed query.")
         return []
-
-    # Scale candidate_k with repo count so every repo gets a fair share of
-    # the pool. list_all_repos() is cheap (no vector search) and the result
-    # is already cached in the engine's session on subsequent turns, but
-    # here we call it directly because retrieve_cross_repo_comparative has
-    # no session access. In practice this is one extra metadata read, not
-    # a full Deep Lake reload, so the cost is negligible.
-    repo_count = len(list_all_repos())
-    candidate_k = max(CANDIDATE_K_MIN, repo_count * CANDIDATE_K_PER_REPO)
-    print(f"  [retriever] {repo_count} repos indexed → candidate_k={candidate_k}")
 
     results = similarity_search_aggregated(
         query_vector=query_vector,
@@ -422,7 +587,8 @@ def retrieve_cross_repo_semantic(question: str) -> list[dict]:
     q = question[:80] + "..." if len(question) > 80 else question
     print(f"  [retriever] Cross-repo semantic search (per-repo): '{q}'")
 
-    query_vector = embed_query(question)
+    rewritten    = _rewrite_for_retrieval(question)
+    query_vector = embed_query(rewritten)
     if query_vector is None:
         print("  [retriever] Failed to embed query.")
         return []
@@ -444,25 +610,28 @@ def retrieve_repo_specific(
 ) -> list[dict]:
     """
     Hybrid search (BM25 + cosine via RRF) + cross-encoder re-ranking within
-    a single repo, with query enrichment and deduplication.
+    a single repo, with query enrichment, HyDE, and deduplication.
 
     This is the primary retrieval path. The full pipeline:
-      1. Enrich the query with recent conversation context
-      2. Embed the enriched query (for cosine component of hybrid search)
-      3. Run hybrid_search: BM25 + cosine + RRF, filtered to repo_name
+      1. Enrich the query with recent conversation context (_build_enriched_query)
+      2. Generate a hypothetical code snippet via HyDE (_generate_hyde_query)
+         — closes the semantic gap between natural language questions and code
+      3. Embed the HyDE snippet (for cosine component of hybrid search)
+      4. Run hybrid_search: BM25 + cosine + RRF, filtered to repo_name
          → returns TOP_K_HYBRID_FETCH (20) candidates
-      4. Re-rank all 20 candidates with the Jina rerank API
-         → reorders by precise (query, chunk) relevance score
-      5. Deduplicate against seen_chunk_ids (capped deque — FIX 7)
-         → removes chunks already seen this session
-      6. Return up to TOP_K_REPO_SPECIFIC (5) fresh chunks
+      5. Re-rank all 20 candidates with the Jina rerank API using the
+         ENRICHED query (not HyDE) — cross-encoders work better with
+         natural language intent than with hypothetical code snippets
+      6. Deduplicate against seen_chunk_ids (capped deque — FIX 7)
+      7. Return up to TOP_K_REPO_SPECIFIC (5) fresh chunks
 
-    WHY HYBRID + RE-RANK (not just one or the other):
-      Hybrid search (step 3) gives strong recall — the right chunks are very
-      likely to be in the top 20 because both BM25 (lexical) and cosine
-      (semantic) are working together. Re-ranking (step 4) gives strong
-      precision — from those 20, the cross-encoder picks the 5 that best
-      answer this specific question. The two are complementary.
+    WHY HyDE FOR EMBEDDING BUT ENRICHED FOR RERANKING:
+      HyDE bridges the question→code semantic gap at embedding time — a
+      hypothetical snippet lives in the same vector space as indexed code.
+      But the Jina reranker is a cross-encoder: it reads both query and
+      chunk text together and scores their interaction. Natural language
+      intent is a clearer signal for that comparison than a hypothetical
+      snippet that may use different naming than the actual chunks.
 
     Parameters:
         question               Current user question.
@@ -474,10 +643,11 @@ def retrieve_repo_specific(
 
     Returns fresh chunk dicts sorted by re-rank score descending.
     """
-    enriched = _build_enriched_query(question, conversation_history)
+    enriched     = _build_enriched_query(question, conversation_history)
+    hyde_query   = _generate_hyde_query(question, repo_name, enriched)
     print(f"  [retriever] Repo-specific hybrid search in '{repo_name}'")
 
-    query_vector = embed_query(enriched)
+    query_vector = embed_query(hyde_query)
     if query_vector is None:
         print("  [retriever] Failed to embed query.")
         return []
@@ -485,7 +655,7 @@ def retrieve_repo_specific(
     # Step 3: Hybrid search — fetch TOP_K_HYBRID_FETCH candidates.
     raw = hybrid_search(
         query_vector=query_vector,
-        query_text=enriched,
+        query_text=hyde_query,
         top_k=TOP_K_HYBRID_FETCH,
         repo_name=repo_name,
     )
@@ -494,8 +664,12 @@ def retrieve_repo_specific(
         return []
 
     # Step 4: Re-rank with Jina API.
-    # The enriched query is used (not just the bare question) so the
-    # re-ranker has the same conversational context as the embedding.
+    # Use the enriched natural language query for re-ranking, not the HyDE
+    # snippet. The reranker is a cross-encoder that compares query and chunk
+    # text directly — natural language is a better signal for that comparison
+    # than a hypothetical code snippet which may use different naming than
+    # the actual chunks. HyDE's value is in the embedding space; once we
+    # have the candidates, the reranker works better with the original intent.
     reranked = _rerank(enriched, raw)
 
     # Step 5: Deduplicate against seen_chunk_ids.

@@ -69,6 +69,7 @@ SESSION MANAGEMENT (repo_specific only):
   or explicitly types "reset" in the CLI.
 """
 
+import os
 import time
 from typing import Optional
 from gemini_client import get_client, GEMINI_MODEL
@@ -80,6 +81,15 @@ from query.retriever import (retrieve_cross_repo_metadata,
                              retrieve_repo_specific,
                              make_seen_chunk_ids)
 from indexer.deeplake_store import list_all_repos
+from indexer.github_client  import GitHubClient
+
+# Default branch used when fetching file content for the result dict.
+# Neither list_all_repos() nor per-chunk metadata carry a branch field
+# today, so there's nothing more specific to use. If get_file_content()
+# 404s because a repo's default branch isn't "main", _build_result()
+# just returns an empty FileItem for that file rather than crashing —
+# see the "Failure handling" rule in INTEGRATION_PLAN.md Section 5.
+DEFAULT_BRANCH = "main"
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +486,94 @@ If something is unclear from the retrieved code, say so — don't guess."""
 
 
 # ---------------------------------------------------------------------------
+# Structured result building (for the API layer — see INTEGRATION_PLAN.md)
+# ---------------------------------------------------------------------------
+
+def _extract_summary(answer: str) -> str:
+    """
+    Extract a short summary from the answer for the frontend's summary card.
+
+    Splits on the first ". " or newline, whichever comes first and is within
+    200 chars — no extra Gemini call, just a string split, per plan Section 10c.
+    """
+    for sep in [". ", "\n"]:
+        idx = answer.find(sep)
+        if idx != -1 and idx < 200:
+            return answer[:idx + 1].strip()
+    return answer[:200].strip()
+
+
+def _build_result(
+    query_type: str,
+    answer: str,
+    chunks: list[dict],
+    repo: Optional[str],
+    repo_metadata: Optional[dict],
+    github_client: GitHubClient,
+) -> dict:
+    """
+    Assemble the structured result dict consumed by api/server.py.
+
+    Fetches file content from GitHub for every unique file referenced by
+    `chunks`, de-duplicated by (repo_name, file_path). See
+    INTEGRATION_PLAN.md Section 4 for the full field spec.
+
+    Never raises — a GitHub fetch failure for one file just leaves that
+    FileItem empty; the text answer is always returned regardless.
+    """
+    summary = _extract_summary(answer)
+
+    chunk_items = []
+    # chunk 0-1 -> "a", chunk 2-3 -> "b", chunk 4+ -> "c" (plan Section 4, ChunkItem.col)
+    col_map = {0: "a", 1: "a", 2: "b", 3: "b"}
+    for i, chunk in enumerate(chunks):
+        chunk_items.append({
+            "index":       i + 1,
+            "text":        chunk.get("text", ""),
+            "file_path":   chunk.get("file_path", ""),
+            "file_role":   chunk.get("file_role", "other"),
+            "chunk_index": chunk.get("chunk_index", 0),
+            "repo_name":   chunk.get("repo_name", ""),
+            "score":       chunk.get("rerank_score", chunk.get("score", 0.0)),
+            "col":         col_map.get(i, "c"),
+        })
+
+    # Fetch unique file contents from GitHub, de-duplicated by repo+path.
+    files = {}
+    seen = set()
+    for chunk in chunks:
+        repo_n    = chunk.get("repo_name", "")
+        file_path = chunk.get("file_path", "")
+        key       = f"{repo_n}::{file_path}"
+        if key not in seen and file_path:
+            seen.add(key)
+            try:
+                content = github_client.get_file_content(
+                    repo_n, file_path, DEFAULT_BRANCH
+                ) or ""
+            except Exception as e:
+                print(f"  [engine] get_file_content failed for "
+                      f"{repo_n}/{file_path}: {e}")
+                content = ""
+            files[file_path] = {
+                "name":     file_path,
+                "content":  content,
+                "language": file_path.rsplit(".", 1)[-1] if "." in file_path else "text",
+                "lines":    content.splitlines() if content else [],
+            }
+
+    return {
+        "query_type":    query_type,
+        "repo":          repo,
+        "answer":        answer,
+        "summary":       summary,
+        "chunks":        chunk_items,
+        "files":         files,
+        "repo_metadata": repo_metadata,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Answer generation
 # ---------------------------------------------------------------------------
 
@@ -512,18 +610,22 @@ def _generate_answer(prompt: str, client, max_retries: int = 3) -> str:
 def query(
     question: str,
     session: Optional[dict] = None,
-) -> tuple[str, Optional[dict]]:
+) -> tuple[str, Optional[dict], dict]:
     """
     Process a user question end-to-end and return an answer.
 
-    This is the only function cli.py needs to call.
+    This is the only function cli.py (and now api/server.py) needs to call.
 
     Parameters:
         question  The user's natural language question.
         session   Current session dict or None.
 
     Returns:
-        (answer_str, updated_session)
+        (answer_str, updated_session, result)
+
+        `result` is the structured dict consumed by the API layer — see
+        INTEGRATION_PLAN.md Section 4. cli.py doesn't need it and discards
+        it: `answer, session, _ = query(...)`.
 
     FIX 2 — list_all_repos() caching:
       list_all_repos() is called once per query() invocation and its result
@@ -538,8 +640,9 @@ def query(
       we log a warning and return an informative error rather than silently
       creating a broken session with empty metadata.
     """
-    client      = get_client()
-    active_repo = session["active_repo"] if session else None
+    client        = get_client()
+    github_client = GitHubClient(token=os.getenv("GITHUB_TOKEN"))
+    active_repo   = session["active_repo"] if session else None
 
     # Pull comparison_repos from the session (set by _new_comparison_session
     # on the previous turn, if the last question was cross_repo_comparative).
@@ -564,7 +667,8 @@ def query(
         repos  = list_all_repos()
         prompt = _build_metadata_prompt(question, repos)
         answer = _generate_answer(prompt, client)
-        return answer, _new_context_session(question, answer)
+        result = _build_result("list_repos", answer, [], None, None, github_client)
+        return answer, _new_context_session(question, answer), result
 
     # -----------------------------------------------------------------------
     # cross_repo_metadata
@@ -572,14 +676,19 @@ def query(
     if query_type == "cross_repo_metadata":
         repos = retrieve_cross_repo_metadata()
         if not repos:
-            return (
-                "No repos are indexed yet. "
-                "Run `python cli.py index --mode full` first.",
-                None,
+            answer = ("No repos are indexed yet. "
+                       "Run `python cli.py index --mode full` first.")
+            result = _build_result(
+                "cross_repo_metadata", answer, [], None, None, github_client
             )
+            result["error"] = "not_indexed"
+            return answer, None, result
         prompt = _build_metadata_prompt(question, repos)
         answer = _generate_answer(prompt, client)
-        return answer, _new_context_session(question, answer)
+        result = _build_result(
+            "cross_repo_metadata", answer, [], None, None, github_client
+        )
+        return answer, _new_context_session(question, answer), result
 
     # -----------------------------------------------------------------------
     # cross_repo_semantic
@@ -587,15 +696,20 @@ def query(
     if query_type == "cross_repo_semantic":
         chunks = retrieve_cross_repo_semantic(question)
         if not chunks:
-            return (
-                "I couldn't find relevant code for that question across your repos. "
-                "Make sure your repos are indexed with "
-                "`python cli.py index --mode full`.",
-                None,
+            answer = ("I couldn't find relevant code for that question across your repos. "
+                       "Make sure your repos are indexed with "
+                       "`python cli.py index --mode full`.")
+            result = _build_result(
+                "cross_repo_semantic", answer, [], None, None, github_client
             )
+            result["error"] = "not_indexed"
+            return answer, None, result
         prompt = _build_semantic_prompt(question, chunks)
         answer = _generate_answer(prompt, client)
-        return answer, _new_context_session(question, answer)
+        result = _build_result(
+            "cross_repo_semantic", answer, chunks, None, None, github_client
+        )
+        return answer, _new_context_session(question, answer), result
 
     # -----------------------------------------------------------------------
     # cross_repo_comparative
@@ -636,13 +750,18 @@ def query(
                     available = [r["repo_name"] for r in all_repos_for_cmp]
                     print(f"[engine] WARNING: partial named-repo match. "
                           f"Matched: {named_repos}, unmatched: {unmatched}")
-                    return (
+                    answer = (
                         f"I couldn't find a repo named "
                         f"'{', '.join(unmatched)}' in your indexed repos, so I "
                         f"can't run this comparison. Your indexed repos are: "
-                        f"{', '.join(available)}. Check the spelling and try again.",
-                        session,   # preserve whatever session existed — don't wipe it
+                        f"{', '.join(available)}. Check the spelling and try again."
                     )
+                    result = _build_result(
+                        "cross_repo_comparative", answer, [], None, None, github_client
+                    )
+                    result["error"] = "repo_not_found"
+                    # preserve whatever session existed — don't wipe it
+                    return answer, session, result
 
                 if not named_repos:
                     print("[engine] All named repos failed normalization. "
@@ -673,18 +792,28 @@ def query(
             named_repos=named_repos,   # None → global ranking, list → ONLY these repos
         )
         if not ranked_repos:
-            return (
-                "I couldn't find enough relevant code across your repos to "
-                "make a comparison. Make sure your repos are indexed with "
-                "`python cli.py index --mode full`.",
-                session if is_followup else None,
+            answer = ("I couldn't find enough relevant code across your repos to "
+                       "make a comparison. Make sure your repos are indexed with "
+                       "`python cli.py index --mode full`.")
+            result = _build_result(
+                "cross_repo_comparative", answer, [], None, None, github_client
             )
+            result["error"] = "not_indexed"
+            return answer, (session if is_followup else None), result
         prompt = _build_comparative_prompt(
             question,
             ranked_repos,
             comparison_history=prior_history,
         )
         answer = _generate_answer(prompt, client)
+
+        # Flatten all chunks from all ranked repos for the result dict
+        # (plan Section 7: cross_repo_comparative chunks are "all chunks
+        # from all ranked repos, flattened").
+        flat_chunks = [c for repo in ranked_repos for c in repo.get("chunks", [])]
+        result = _build_result(
+            "cross_repo_comparative", answer, flat_chunks, None, None, github_client
+        )
 
         # Build a comparison session so the repos just compared are recorded.
         # Uses named_repos if the router named specific repos; otherwise falls
@@ -713,7 +842,7 @@ def query(
             {"role": "user",      "content": question},
             {"role": "assistant", "content": answer},
         ]
-        return answer, new_session
+        return answer, new_session, result
 
     # -----------------------------------------------------------------------
     # repo_specific — deep dive with session management
@@ -731,11 +860,13 @@ def query(
 
     # FIX 6: Guard against empty repo list — log clearly and return informative error.
     if not all_repos:
-        return (
-            "I couldn't load the indexed repo list from Deep Lake. "
-            "Check your ACTIVELOOP_TOKEN and ACTIVELOOP_ORG, then try again.",
-            session,
+        answer = ("I couldn't load the indexed repo list from Deep Lake. "
+                   "Check your ACTIVELOOP_TOKEN and ACTIVELOOP_ORG, then try again.")
+        result = _build_result(
+            "repo_specific", answer, [], repo_name, None, github_client
         )
+        result["error"] = "not_indexed"
+        return answer, session, result
 
     # FIX 6: Case-insensitive normalization — BEFORE the session continuation check.
     # If the router returns "corplaw-ai" but the dataset has "CorpLaw-AI",
@@ -755,12 +886,16 @@ def query(
         # is mid-conversation about CorpLaw-AI and asks about a misspelled
         # repo) should fail THIS turn only — not destroy the active session.
         # The user can correct the name and continue where they left off.
-        return (
+        answer = (
             f"I couldn't find a repo named '{repo_name}' in your indexed repos. "
             f"Try asking about one of your indexed repos by its exact name, or "
-            f"run `python cli.py index --mode full` if you haven't indexed yet.",
-            session,
+            f"run `python cli.py index --mode full` if you haven't indexed yet."
         )
+        result = _build_result(
+            "repo_specific", answer, [], None, None, github_client
+        )
+        result["error"] = "repo_not_found"
+        return answer, session, result
 
     if matched_repo["repo_name"] != repo_name:
         print(f"[engine] Normalized repo name: '{repo_name}' → '{matched_repo['repo_name']}'")
@@ -815,4 +950,8 @@ def query(
         {"role": "assistant", "content": answer}
     )
 
-    return answer, session
+    result = _build_result(
+        "repo_specific", answer, chunks, repo_name,
+        session.get("repo_metadata"), github_client,
+    )
+    return answer, session, result
