@@ -1,0 +1,61 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+/*
+  Palette, fonts, and highlight tokens ported 1:1 from the original
+  index.html mock's :root custom properties — see INTEGRATION_PROGRESS.md
+  for why these are treated as fixed design decisions, not re-derived.
+*/
+@theme {
+  --color-muted-teal:   #80aea0;
+  --color-bright-green: #8aea92;
+  --color-purple:       #592e83;
+  --color-charcoal:     #363635;
+  --color-dark-green:   #0f1f0f;
+  --color-cream:        #f5f0e8;
+  --color-cream-dark:   #e8e1d4;
+
+  --color-hl-a-bg: rgba(89,46,131,.10);
+  --color-hl-a-bd: rgba(89,46,131,.40);
+  --color-hl-b-bg: rgba(128,174,160,.18);
+  --color-hl-b-bd: rgba(128,174,160,.55);
+  --color-hl-c-bg: rgba(138,234,146,.15);
+  --color-hl-c-bd: rgba(80,160,80,.40);
+
+  --font-mono: 'Space Mono', monospace;
+  --font-sans: 'Inter', sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-cream text-charcoal font-sans min-h-screen;
+  }
+}
+
+/* ── Ticker animation (kept as raw CSS — Tailwind has no keyframe authoring) ── */
+@keyframes ticker {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.ticker-track {
+  animation: ticker 22s linear infinite;
+  will-change: transform;
+}
+
+/* ── Syntax token colours — ported from index.html's .tok-* classes ── */
+.tok-kw   { color: #ffffff; font-weight: 700; }
+.tok-str  { color: var(--color-bright-green); }
+.tok-cmt  { color: rgba(255,255,255,.32); font-style: italic; }
+.tok-fn   { color: var(--color-bright-green); opacity: .85; }
+.tok-num  { color: #ffffff; }
+.tok-prop { color: var(--color-muted-teal); }
+.tok-punc { color: rgba(255,255,255,.38); }
+
+/* ── Line-highlight row backgrounds — can't express rgba mixes cleanly as
+   Tailwind utilities without a lot of noise, kept as small utility classes ── */
+.hl-row-a { background: rgba(89,46,131,.28) !important; }
+.hl-row-a td.ln { background: rgba(89,46,131,.35) !important; color: rgba(255,255,255,.45) !important; }
+.hl-row-b { background: rgba(128,174,160,.22) !important; }
+.hl-row-b td.ln { background: rgba(128,174,160,.28) !important; color: rgba(255,255,255,.45) !important; }
+.hl-row-c { background: rgba(138,234,146,.14) !important; }
+.hl-row-c td.ln { background: rgba(138,234,146,.2) !important; color: rgba(255,255,255,.45) !important; }
