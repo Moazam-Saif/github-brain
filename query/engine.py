@@ -527,9 +527,19 @@ def _build_result(
     # chunk 0-1 -> "a", chunk 2-3 -> "b", chunk 4+ -> "c" (plan Section 4, ChunkItem.col)
     col_map = {0: "a", 1: "a", 2: "b", 3: "b"}
     for i, chunk in enumerate(chunks):
+        raw_text = chunk.get("text", "")
+        # chunker.py prepends "File: <path> | Role: <role> | Purpose: <purpose>" to
+        # chunk 0 of every file (blueprint Section on context headers) — that's
+        # embedding scaffolding, not something a human should see verbatim in the
+        # UI. Strip it if present so the frontend only ever sees real source text.
+        display_text = raw_text
+        if display_text.startswith("File: ") and " | Role: " in display_text.split("\n", 1)[0]:
+            first_line, _, rest = display_text.partition("\n")
+            display_text = rest.lstrip("\n")
+
         chunk_items.append({
             "index":       i + 1,
-            "text":        chunk.get("text", ""),
+            "text":        display_text,
             "file_path":   chunk.get("file_path", ""),
             "file_role":   chunk.get("file_role", "other"),
             "chunk_index": chunk.get("chunk_index", 0),
