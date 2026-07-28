@@ -4,16 +4,12 @@ const COL_STYLES = {
   c: { num: 'bg-bright-green/25 text-[#2e7a38]', hl: 'bg-hl-c-bg border-hl-c-bd' },
 };
 
-// Chunk text is raw source code (see engine.py's _build_result — the "File: ... |
-// Role: ... | Purpose: ..." embedding header is already stripped server-side, but
-// the body is still real code, not prose). Show a short preview, not the whole thing.
-const PREVIEW_LINE_COUNT = 4;
-
-function previewLines(text) {
-  const lines = (text || '').split('\n').filter((l) => l.trim() !== '');
-  const preview = lines.slice(0, PREVIEW_LINE_COUNT);
-  return { preview, truncated: lines.length > PREVIEW_LINE_COUNT };
-}
+// chunk.heading/chunk.text are parsed server-side from the SAME Gemini call
+// that produced the main answer (see engine.py's CHUNK_STRUCTURE_INSTRUCTION /
+// _split_answer_and_chunk_blocks) — real prose explanation with a short
+// heading, not raw code. The actual code lives in the Source file panel via
+// `files`. If parsing didn't find a block for a chunk (heading/text both
+// empty — partial-degrade case), fall back to just the file reference.
 
 export default function ChunkList({ chunks, selectedIndex, onSelect }) {
   if (!chunks || chunks.length === 0) {
@@ -31,7 +27,7 @@ export default function ChunkList({ chunks, selectedIndex, onSelect }) {
       {chunks.map((chunk) => {
         const style = COL_STYLES[chunk.col] || COL_STYLES.c;
         const isSelected = selectedIndex === chunk.index;
-        const { preview, truncated } = previewLines(chunk.text);
+        const hasExplanation = chunk.heading || chunk.text;
         return (
           <div
             key={chunk.index}
@@ -47,17 +43,26 @@ export default function ChunkList({ chunks, selectedIndex, onSelect }) {
             >
               {chunk.index}
             </div>
-            <div className="min-w-0 flex-1">
-              <pre className="font-mono text-[0.72rem] leading-[1.55] text-charcoal whitespace-pre-wrap break-words bg-black/[0.03] rounded px-2 py-1.5 overflow-hidden">
-                {preview.join('\n')}
-                {truncated && (
-                  <span className="text-muted-teal">{'\n…'}</span>
-                )}
-              </pre>
+            <div className="min-w-0">
+              {hasExplanation ? (
+                <>
+                  {chunk.heading && (
+                    <div className="text-[0.78rem] font-semibold text-charcoal mb-0.5">
+                      {chunk.heading}
+                    </div>
+                  )}
+                  <div className="text-[0.82rem] leading-[1.62] text-charcoal">
+                    {chunk.text}
+                  </div>
+                </>
+              ) : (
+                <div className="text-[0.82rem] leading-[1.62] text-muted-teal italic">
+                  Related code — see file reference below.
+                </div>
+              )}
               <div className="font-mono text-[0.63rem] text-muted-teal mt-1 whitespace-nowrap overflow-hidden text-ellipsis">
                 {chunk.repo_name ? `${chunk.repo_name} · ` : ''}
                 {chunk.file_path} · chunk {chunk.chunk_index}
-                {truncated && ' · click to view full file →'}
               </div>
             </div>
           </div>

@@ -94,11 +94,19 @@ export default function App() {
                 </p>
               </div>
             ) : hasChunks ? (
-              <ChunkList
-                chunks={result.chunks}
-                selectedIndex={selectedChunk?.index}
-                onSelect={setSelectedChunk}
-              />
+              <div className="flex-1 overflow-y-auto flex flex-col">
+                <ProseAnswer
+                  answer={result.answer}
+                  chunks={result.chunks}
+                  onJumpToChunk={setSelectedChunk}
+                />
+                <div className="border-t border-muted-teal/40 mx-2.5" />
+                <ChunkList
+                  chunks={result.chunks}
+                  selectedIndex={selectedChunk?.index}
+                  onSelect={setSelectedChunk}
+                />
+              </div>
             ) : (
               <ProseAnswer answer={result.answer} />
             )}

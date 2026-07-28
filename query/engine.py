@@ -70,6 +70,7 @@ SESSION MANAGEMENT (repo_specific only):
 """
 
 import os
+import re
 import time
 from typing import Optional
 from gemini_client import get_client, GEMINI_MODEL
@@ -340,12 +341,26 @@ Repository metadata:
 {repos_text}"""
 
 
+CHUNK_STRUCTURE_INSTRUCTION = """
+
+After your answer, add a line containing only ---CHUNKS--- and then, for each
+numbered code chunk above, write:
+[N] Short heading (a few words)
+One to three sentences explaining what that chunk does and how it relates to
+the question.
+
+Include exactly one [N] block per chunk shown above, in the same order, using
+the same chunk numbers. In your main answer above the ---CHUNKS--- line, when
+you reference a specific chunk's code, cite it inline like [N] right after the
+reference (e.g. "the Posts model [1] defines each blog entry")."""
+
+
 def _build_semantic_prompt(question: str, chunks: list[dict]) -> str:
     """Prompt for cross_repo_semantic questions."""
     chunks_text = "\n\n---\n\n".join(
-        f"Repo: {c.get('repo_name')} | File: {c.get('file_path')}\n"
+        f"[{i + 1}] Repo: {c.get('repo_name')} | File: {c.get('file_path')}\n"
         f"Similarity score: {c.get('score', 0):.2f}\n\n{c.get('text', '')}"
-        for c in chunks
+        for i, c in enumerate(chunks)
     )
 
     return f"""You are GitHub Brain, an assistant that helps a developer understand their GitHub repositories.
@@ -357,7 +372,8 @@ If the answer cannot be determined from the provided context, say so honestly.
 Question: {question}
 
 Retrieved code context:
-{chunks_text}"""
+{chunks_text}
+{CHUNK_STRUCTURE_INSTRUCTION}"""
 
 
 def _build_comparative_prompt(
@@ -377,12 +393,16 @@ def _build_comparative_prompt(
     where there's nothing to include yet.
     """
     sections = []
+    chunk_counter = 0  # global sequential numbering, must match flat_chunks order
     for repo in ranked_repos:
-        chunks_text = "\n\n".join(
-            f"  [{c.get('file_path')} chunk {c.get('chunk_index')}]"
-            f" (score {c.get('score', 0):.2f})\n  {c.get('text', '')}"
-            for c in repo.get("chunks", [])
-        )
+        chunk_lines = []
+        for c in repo.get("chunks", []):
+            chunk_counter += 1
+            chunk_lines.append(
+                f"  [{chunk_counter}] {c.get('file_path')} chunk {c.get('chunk_index')}"
+                f" (score {c.get('score', 0):.2f})\n  {c.get('text', '')}"
+            )
+        chunks_text = "\n\n".join(chunk_lines)
         techs    = ", ".join(repo.get("repo_technologies", [])) or "unknown"
         deployed = repo.get("deployment_url") or "not deployed"
 
@@ -422,7 +442,8 @@ say so and explain why. If they're comparable, say that too.
 Question: {question}
 
 Ranked repositories (by topic relevance):
-{repos_text}"""
+{repos_text}
+{CHUNK_STRUCTURE_INSTRUCTION}"""
 
 
 def _build_repo_specific_prompt(
@@ -461,10 +482,10 @@ def _build_repo_specific_prompt(
 
     # Show re-rank score if available, otherwise fall back to cosine score.
     chunks_text = "\n\n---\n\n".join(
-        f"File: {c.get('file_path')} (chunk {c.get('chunk_index')})\n"
+        f"[{i + 1}] File: {c.get('file_path')} (chunk {c.get('chunk_index')})\n"
         f"Relevance: {c.get('rerank_score', c.get('score', 0)):.2f}\n\n"
         f"{c.get('text', '')}"
-        for c in chunks
+        for i, c in enumerate(chunks)
     )
 
     return f"""You are GitHub Brain, an assistant helping a developer deeply understand one of their repositories.
@@ -482,12 +503,71 @@ Current question: {question}
 
 Answer thoroughly. Reference specific file paths and function/class names.
 If the answer spans multiple files, explain how they connect.
-If something is unclear from the retrieved code, say so — don't guess."""
+If something is unclear from the retrieved code, say so — don't guess.
+{CHUNK_STRUCTURE_INSTRUCTION}"""
 
 
 # ---------------------------------------------------------------------------
 # Structured result building (for the API layer — see INTEGRATION_PLAN.md)
 # ---------------------------------------------------------------------------
+
+CHUNK_BLOCK_MARKER = "---CHUNKS---"
+CHUNK_BLOCK_RE = re.compile(r"^\[(\d+)\]\s*(.*)$")
+
+
+def _split_answer_and_chunk_blocks(answer: str) -> tuple[str, dict[int, dict]]:
+    """
+    Split Gemini's response into (main_answer, chunk_explanations).
+
+    Expects the format requested by CHUNK_STRUCTURE_INSTRUCTION:
+        <main answer, optionally with inline [N] references>
+        ---CHUNKS---
+        [1] Heading
+        Explanation text, can span multiple lines.
+
+        [2] Heading
+        Explanation text.
+
+    Returns:
+      main_answer: everything before the marker (or the whole answer if the
+        marker is missing — safe fallback, no chunk explanations parsed).
+      chunk_explanations: {chunk_number: {"heading": str, "text": str}} for
+        every [N] block that parsed correctly. Only well-formed blocks are
+        included — a malformed individual block is skipped rather than
+        breaking the whole parse (partial degrade, not all-or-nothing).
+    """
+    if CHUNK_BLOCK_MARKER not in answer:
+        return answer.strip(), {}
+
+    main_answer, _, block_text = answer.partition(CHUNK_BLOCK_MARKER)
+    main_answer = main_answer.strip()
+
+    explanations: dict[int, dict] = {}
+    current_num = None
+    current_heading = ""
+    current_lines: list[str] = []
+
+    def _flush():
+        text = " ".join(l.strip() for l in current_lines if l.strip()).strip()
+        if current_num is not None and current_heading.strip() and text:
+            explanations[current_num] = {
+                "heading": current_heading.strip(),
+                "text": text,
+            }
+
+    for line in block_text.split("\n"):
+        m = CHUNK_BLOCK_RE.match(line.strip())
+        if m:
+            _flush()
+            current_num = int(m.group(1))
+            current_heading = m.group(2)
+            current_lines = []
+        elif current_num is not None:
+            current_lines.append(line)
+    _flush()
+
+    return main_answer, explanations
+
 
 def _extract_summary(answer: str) -> str:
     """
@@ -520,26 +600,26 @@ def _build_result(
 
     Never raises — a GitHub fetch failure for one file just leaves that
     FileItem empty; the text answer is always returned regardless.
+
+    ChunkItem.heading/text come from parsing the SAME Gemini call that
+    produced `answer` (see CHUNK_STRUCTURE_INSTRUCTION / prompt builders) —
+    no extra API call. If a chunk's block didn't parse (missing, malformed,
+    or the marker wasn't present at all), it falls back to just the file
+    reference with no heading/text, rather than a fabricated placeholder —
+    see the "partial degrade" decision in INTEGRATION_PROGRESS.md.
     """
-    summary = _extract_summary(answer)
+    main_answer, chunk_blocks = _split_answer_and_chunk_blocks(answer)
+    summary = _extract_summary(main_answer)
 
     chunk_items = []
     # chunk 0-1 -> "a", chunk 2-3 -> "b", chunk 4+ -> "c" (plan Section 4, ChunkItem.col)
     col_map = {0: "a", 1: "a", 2: "b", 3: "b"}
     for i, chunk in enumerate(chunks):
-        raw_text = chunk.get("text", "")
-        # chunker.py prepends "File: <path> | Role: <role> | Purpose: <purpose>" to
-        # chunk 0 of every file (blueprint Section on context headers) — that's
-        # embedding scaffolding, not something a human should see verbatim in the
-        # UI. Strip it if present so the frontend only ever sees real source text.
-        display_text = raw_text
-        if display_text.startswith("File: ") and " | Role: " in display_text.split("\n", 1)[0]:
-            first_line, _, rest = display_text.partition("\n")
-            display_text = rest.lstrip("\n")
-
+        block = chunk_blocks.get(i + 1)
         chunk_items.append({
             "index":       i + 1,
-            "text":        display_text,
+            "heading":     block["heading"] if block else "",
+            "text":        block["text"] if block else "",
             "file_path":   chunk.get("file_path", ""),
             "file_role":   chunk.get("file_role", "other"),
             "chunk_index": chunk.get("chunk_index", 0),
@@ -575,7 +655,7 @@ def _build_result(
     return {
         "query_type":    query_type,
         "repo":          repo,
-        "answer":        answer,
+        "answer":        main_answer,
         "summary":       summary,
         "chunks":        chunk_items,
         "files":         files,
@@ -962,6 +1042,6 @@ def query(
 
     result = _build_result(
         "repo_specific", answer, chunks, repo_name,
-        session.get("repo_metadata"), github_client,
+        session.get("repo_metadata"), github_client
     )
     return answer, session, result
