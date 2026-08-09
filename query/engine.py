@@ -72,6 +72,7 @@ SESSION MANAGEMENT (repo_specific only):
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from gemini_client import get_client, GEMINI_MODEL
 
@@ -341,18 +342,39 @@ Repository metadata:
 {repos_text}"""
 
 
-CHUNK_STRUCTURE_INSTRUCTION = """
+RESPONSE_STRUCTURE_INSTRUCTION = """
 
-After your answer, add a line containing only ---CHUNKS--- and then, for each
-numbered code chunk above, write:
+Structure your ENTIRE response using exactly these four labeled parts, in
+this order, each starting on its own line with the marker shown:
+
+---SUMMARY---
+Write 2-4 full sentences summarizing the answer. This must stand alone and
+make sense without reading the rest of the response — it will be shown to
+the user separately, before anything else. Do not just repeat the first
+sentence of your answer here; write a real, self-contained summary.
+
+---SECTIONS---
+List each section heading you will use in your answer below, one per line,
+like:
+[S1] First section heading
+[S2] Second section heading
+Use short, descriptive headings (a few words each). Use as many or as few
+sections as the answer actually needs — at least one.
+
+---ANSWER---
+Write your full answer here, organized under markdown headings that exactly
+match the section headings listed above (## First section heading, etc).
+Do NOT repeat the summary here. When you reference a specific code chunk
+(numbered below), cite it inline like [N] right after the reference, e.g.
+"the Posts model [1] defines each blog entry".
+
+---CHUNKS---
+For each numbered code chunk provided to you, write:
 [N] Short heading (a few words)
-One to three sentences explaining what that chunk does and how it relates to
-the question.
-
-Include exactly one [N] block per chunk shown above, in the same order, using
-the same chunk numbers. In your main answer above the ---CHUNKS--- line, when
-you reference a specific chunk's code, cite it inline like [N] right after the
-reference (e.g. "the Posts model [1] defines each blog entry")."""
+One to three sentences explaining what that chunk does and how it relates
+to the question.
+Include exactly one [N] block per chunk, in the same order and using the
+same chunk numbers given to you."""
 
 
 def _build_semantic_prompt(question: str, chunks: list[dict]) -> str:
@@ -373,7 +395,7 @@ Question: {question}
 
 Retrieved code context:
 {chunks_text}
-{CHUNK_STRUCTURE_INSTRUCTION}"""
+{RESPONSE_STRUCTURE_INSTRUCTION}"""
 
 
 def _build_comparative_prompt(
@@ -443,7 +465,7 @@ Question: {question}
 
 Ranked repositories (by topic relevance):
 {repos_text}
-{CHUNK_STRUCTURE_INSTRUCTION}"""
+{RESPONSE_STRUCTURE_INSTRUCTION}"""
 
 
 def _build_repo_specific_prompt(
@@ -504,45 +526,28 @@ Current question: {question}
 Answer thoroughly. Reference specific file paths and function/class names.
 If the answer spans multiple files, explain how they connect.
 If something is unclear from the retrieved code, say so — don't guess.
-{CHUNK_STRUCTURE_INSTRUCTION}"""
+{RESPONSE_STRUCTURE_INSTRUCTION}"""
 
 
 # ---------------------------------------------------------------------------
 # Structured result building (for the API layer — see INTEGRATION_PLAN.md)
 # ---------------------------------------------------------------------------
 
-CHUNK_BLOCK_MARKER = "---CHUNKS---"
-CHUNK_BLOCK_RE = re.compile(r"^\[(\d+)\]\s*(.*)$")
+SECTION_MARKERS = ["---SUMMARY---", "---SECTIONS---", "---ANSWER---", "---CHUNKS---"]
+CHUNK_BLOCK_RE   = re.compile(r"^\[(\d+)\]\s*(.*)$")
+SECTION_LIST_RE  = re.compile(r"^\[S(\d+)\]\s*(.*)$")
 
 
-def _split_answer_and_chunk_blocks(answer: str) -> tuple[str, dict[int, dict]]:
+def _parse_numbered_blocks(block_text: str, key_re: "re.Pattern") -> dict:
     """
-    Split Gemini's response into (main_answer, chunk_explanations).
-
-    Expects the format requested by CHUNK_STRUCTURE_INSTRUCTION:
-        <main answer, optionally with inline [N] references>
-        ---CHUNKS---
-        [1] Heading
-        Explanation text, can span multiple lines.
-
-        [2] Heading
-        Explanation text.
-
-    Returns:
-      main_answer: everything before the marker (or the whole answer if the
-        marker is missing — safe fallback, no chunk explanations parsed).
-      chunk_explanations: {chunk_number: {"heading": str, "text": str}} for
-        every [N] block that parsed correctly. Only well-formed blocks are
-        included — a malformed individual block is skipped rather than
-        breaking the whole parse (partial degrade, not all-or-nothing).
+    Shared helper: parse a block of "[key] heading\ntext..." groups into
+    {int_key: {"heading": str, "text": str}}, skipping any group missing a
+    non-empty heading or non-empty text (partial degrade — see
+    INTEGRATION_PROGRESS.md's "chunk text should be prose" / course-correction
+    entries for why a malformed individual group is dropped rather than
+    guessed at or allowed to break the whole parse).
     """
-    if CHUNK_BLOCK_MARKER not in answer:
-        return answer.strip(), {}
-
-    main_answer, _, block_text = answer.partition(CHUNK_BLOCK_MARKER)
-    main_answer = main_answer.strip()
-
-    explanations: dict[int, dict] = {}
+    results: dict[int, dict] = {}
     current_num = None
     current_heading = ""
     current_lines: list[str] = []
@@ -550,13 +555,10 @@ def _split_answer_and_chunk_blocks(answer: str) -> tuple[str, dict[int, dict]]:
     def _flush():
         text = " ".join(l.strip() for l in current_lines if l.strip()).strip()
         if current_num is not None and current_heading.strip() and text:
-            explanations[current_num] = {
-                "heading": current_heading.strip(),
-                "text": text,
-            }
+            results[current_num] = {"heading": current_heading.strip(), "text": text}
 
     for line in block_text.split("\n"):
-        m = CHUNK_BLOCK_RE.match(line.strip())
+        m = key_re.match(line.strip())
         if m:
             _flush()
             current_num = int(m.group(1))
@@ -565,22 +567,75 @@ def _split_answer_and_chunk_blocks(answer: str) -> tuple[str, dict[int, dict]]:
         elif current_num is not None:
             current_lines.append(line)
     _flush()
+    return results
 
-    return main_answer, explanations
 
-
-def _extract_summary(answer: str) -> str:
+def _parse_structured_response(raw: str) -> dict:
     """
-    Extract a short summary from the answer for the frontend's summary card.
+    Parse a full (non-streaming) Gemini response in the RESPONSE_STRUCTURE_INSTRUCTION
+    format into its four parts.
 
-    Splits on the first ". " or newline, whichever comes first and is within
-    200 chars — no extra Gemini call, just a string split, per plan Section 10c.
+    Returns:
+      {
+        "summary":  str,                          # from ---SUMMARY---, or "" if missing
+        "sections": [{"heading": str}, ...],       # from ---SECTIONS---, in order
+        "answer":   str,                           # from ---ANSWER---
+        "chunk_blocks": {int: {"heading","text"}}, # from ---CHUNKS---
+      }
+
+    Fallback behavior (partial degrade, matches the streaming parser's
+    behavior for consistency): if ---SUMMARY--- or ---SECTIONS--- markers are
+    missing, those fields come back empty/[] and the frontend falls back to
+    its existing heuristics (e.g. no jump-nav shown). If ---ANSWER--- is
+    missing entirely (total malformation), the raw text is used as-is as the
+    answer, matching the old CHUNK_BLOCK_MARKER-missing fallback.
     """
-    for sep in [". ", "\n"]:
-        idx = answer.find(sep)
-        if idx != -1 and idx < 200:
-            return answer[:idx + 1].strip()
-    return answer[:200].strip()
+    parts = {"summary": "", "sections": [], "answer": raw.strip(), "chunk_blocks": {}}
+
+    if "---SUMMARY---" not in raw:
+        return parts
+
+    # Split on all markers we recognize, keeping track of which section each
+    # piece belongs to.
+    pattern = "(" + "|".join(re.escape(m) for m in SECTION_MARKERS) + ")"
+    pieces = re.split(pattern, raw)
+    # pieces alternates: [pre-marker junk, marker, text, marker, text, ...]
+
+    current_marker = None
+    buffers = {m: "" for m in SECTION_MARKERS}
+    for piece in pieces:
+        if piece in SECTION_MARKERS:
+            current_marker = piece
+        elif current_marker:
+            buffers[current_marker] += piece
+
+    parts["summary"] = buffers["---SUMMARY---"].strip()
+
+    sections_raw = _parse_numbered_blocks(buffers["---SECTIONS---"], SECTION_LIST_RE)
+    parts["sections"] = [
+        {"heading": sections_raw[k]["heading"]}
+        for k in sorted(sections_raw)
+    ] if sections_raw else _parse_section_headings_fallback(buffers["---SECTIONS---"])
+
+    parts["answer"] = buffers["---ANSWER---"].strip() or parts["answer"]
+    parts["chunk_blocks"] = _parse_numbered_blocks(buffers["---CHUNKS---"], CHUNK_BLOCK_RE)
+
+    return parts
+
+
+def _parse_section_headings_fallback(sections_text: str) -> list[dict]:
+    """
+    ---SECTIONS--- entries have no body text (just "[S1] Heading" lines), so
+    _parse_numbered_blocks's "needs non-empty text too" rule would drop every
+    entry. Parse headings directly instead — same [S1]/[S2] regex, but a
+    heading alone is a complete, valid entry here.
+    """
+    headings = []
+    for line in sections_text.split("\n"):
+        m = SECTION_LIST_RE.match(line.strip())
+        if m and m.group(2).strip():
+            headings.append({"heading": m.group(2).strip()})
+    return headings
 
 
 def _build_result(
@@ -595,27 +650,29 @@ def _build_result(
     Assemble the structured result dict consumed by api/server.py.
 
     Fetches file content from GitHub for every unique file referenced by
-    `chunks`, de-duplicated by (repo_name, file_path). See
-    INTEGRATION_PLAN.md Section 4 for the full field spec.
+    `chunks`, de-duplicated by (repo_name, file_path), CONCURRENTLY via a
+    thread pool (github_client is sync/requests-based, so this is I/O-bound
+    parallelism, not true async) — this is "Option C" from the streaming
+    design discussion: files are fetched in parallel rather than serially,
+    so the wait between "chunks known" and "files ready" is roughly the
+    slowest single fetch, not the sum of all of them.
 
     Never raises — a GitHub fetch failure for one file just leaves that
     FileItem empty; the text answer is always returned regardless.
 
-    ChunkItem.heading/text come from parsing the SAME Gemini call that
-    produced `answer` (see CHUNK_STRUCTURE_INSTRUCTION / prompt builders) —
-    no extra API call. If a chunk's block didn't parse (missing, malformed,
-    or the marker wasn't present at all), it falls back to just the file
-    reference with no heading/text, rather than a fabricated placeholder —
-    see the "partial degrade" decision in INTEGRATION_PROGRESS.md.
+    summary/sections/answer/ChunkItem.heading&text all come from parsing the
+    SAME Gemini call that produced `answer` (see RESPONSE_STRUCTURE_INSTRUCTION
+    / prompt builders, and _parse_structured_response) — no extra API call.
+    If a section is missing/malformed, it falls back to an empty value rather
+    than a fabricated one — partial degrade, see INTEGRATION_PROGRESS.md.
     """
-    main_answer, chunk_blocks = _split_answer_and_chunk_blocks(answer)
-    summary = _extract_summary(main_answer)
+    parsed = _parse_structured_response(answer)
 
     chunk_items = []
     # chunk 0-1 -> "a", chunk 2-3 -> "b", chunk 4+ -> "c" (plan Section 4, ChunkItem.col)
     col_map = {0: "a", 1: "a", 2: "b", 3: "b"}
     for i, chunk in enumerate(chunks):
-        block = chunk_blocks.get(i + 1)
+        block = parsed["chunk_blocks"].get(i + 1)
         chunk_items.append({
             "index":       i + 1,
             "heading":     block["heading"] if block else "",
@@ -628,39 +685,63 @@ def _build_result(
             "col":         col_map.get(i, "c"),
         })
 
-    # Fetch unique file contents from GitHub, de-duplicated by repo+path.
-    files = {}
-    seen = set()
+    # Unique (repo, file_path) pairs to fetch, de-duplicated.
+    to_fetch = {}
     for chunk in chunks:
         repo_n    = chunk.get("repo_name", "")
         file_path = chunk.get("file_path", "")
         key       = f"{repo_n}::{file_path}"
-        if key not in seen and file_path:
-            seen.add(key)
-            try:
-                content = github_client.get_file_content(
-                    repo_n, file_path, DEFAULT_BRANCH
-                ) or ""
-            except Exception as e:
-                print(f"  [engine] get_file_content failed for "
-                      f"{repo_n}/{file_path}: {e}")
-                content = ""
-            files[file_path] = {
-                "name":     file_path,
-                "content":  content,
-                "language": file_path.rsplit(".", 1)[-1] if "." in file_path else "text",
-                "lines":    content.splitlines() if content else [],
-            }
+        if key not in to_fetch and file_path:
+            to_fetch[key] = (repo_n, file_path)
+
+    def _fetch_one(key_repo_path):
+        key, (repo_n, file_path) = key_repo_path
+        try:
+            content = github_client.get_file_content(
+                repo_n, file_path, DEFAULT_BRANCH
+            ) or ""
+        except Exception as e:
+            print(f"  [engine] get_file_content failed for "
+                  f"{repo_n}/{file_path}: {e}")
+            content = ""
+        return file_path, content
+
+    files = {}
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=min(8, len(to_fetch))) as pool:
+            for file_path, content in pool.map(_fetch_one, to_fetch.items()):
+                files[file_path] = {
+                    "name":     file_path,
+                    "content":  content,
+                    "language": file_path.rsplit(".", 1)[-1] if "." in file_path else "text",
+                    "lines":    content.splitlines() if content else [],
+                }
 
     return {
         "query_type":    query_type,
         "repo":          repo,
-        "answer":        main_answer,
-        "summary":       summary,
+        "answer":        parsed["answer"],
+        "summary":       parsed["summary"] or _fallback_summary(parsed["answer"]),
+        "sections":      parsed["sections"],
         "chunks":        chunk_items,
         "files":         files,
         "repo_metadata": repo_metadata,
     }
+
+
+def _fallback_summary(answer: str) -> str:
+    """
+    Only used when Gemini's response is missing the ---SUMMARY--- marker
+    entirely (total malformation, not the normal path). Same heuristic the
+    old _extract_summary used — a short string cut, not a real summary — so
+    even in this rare failure case the frontend has SOMETHING to show rather
+    than an empty summary card.
+    """
+    for sep in [". ", "\n"]:
+        idx = answer.find(sep)
+        if idx != -1 and idx < 200:
+            return answer[:idx + 1].strip()
+    return answer[:200].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +774,94 @@ def _generate_answer(prompt: str, client, max_retries: int = 3) -> str:
     return "I encountered an error generating a response. Please try again."
 
 
+def generate_answer_stream(prompt: str, client, max_retries: int = 3):
+    """
+    Streaming counterpart to _generate_answer. Calls Gemini's
+    generate_content_stream() and yields SEMANTIC events as each of the four
+    RESPONSE_STRUCTURE_INSTRUCTION sections is confirmed complete — NOT raw
+    token-by-token text. This is what api/server.py's /ask SSE endpoint
+    consumes directly.
+
+    Yields dicts of the form:
+      {"event": "summary",  "data": {"summary": str}}
+      {"event": "sections", "data": {"sections": [{"heading": str}, ...]}}
+      {"event": "answer",   "data": {"answer": str}}   # full ---ANSWER--- text
+      {"event": "chunk_blocks", "data": {chunk_num: {"heading","text"}}}
+      {"event": "error", "data": {"message": str}}      # on failure, terminal
+
+    A section is only "confirmed complete" once the NEXT marker (or stream
+    end, for the last section) has been seen in the buffer — we can't know
+    ---SUMMARY--- is finished until ---SECTIONS--- starts arriving, since the
+    model could still be mid-sentence. This means the summary event fires as
+    soon as the first few sentences plus the next marker have streamed in —
+    typically a small fraction of the total response — rather than waiting
+    for the whole answer, which is the whole point of streaming this at all.
+
+    Same retry/rate-limit handling as _generate_answer, but retries restart
+    the WHOLE stream (partial output from a failed attempt is discarded) —
+    there's no way to resume a partial Gemini stream.
+    """
+    for attempt in range(max_retries):
+        try:
+            buffer = ""
+            emitted = set()  # which of the 4 markers we've already emitted for
+
+            for chunk in client.models.generate_content_stream(
+                model=GEMINI_MODEL, contents=prompt
+            ):
+                buffer += chunk.text or ""
+
+                # SUMMARY is complete once ---SECTIONS--- has started arriving.
+                if "summary" not in emitted and "---SECTIONS---" in buffer:
+                    summary_text = buffer.split("---SUMMARY---", 1)[-1]
+                    summary_text = summary_text.split("---SECTIONS---", 1)[0].strip()
+                    if summary_text:
+                        emitted.add("summary")
+                        yield {"event": "summary", "data": {"summary": summary_text}}
+
+                # SECTIONS is complete once ---ANSWER--- has started arriving.
+                if "sections" not in emitted and "---ANSWER---" in buffer:
+                    sections_text = buffer.split("---SECTIONS---", 1)[-1]
+                    sections_text = sections_text.split("---ANSWER---", 1)[0].strip()
+                    parsed_sections = _parse_section_headings_fallback(sections_text)
+                    emitted.add("sections")
+                    yield {"event": "sections", "data": {"sections": parsed_sections}}
+
+                # ANSWER is complete once ---CHUNKS--- has started arriving.
+                if "answer" not in emitted and "---CHUNKS---" in buffer:
+                    answer_text = buffer.split("---ANSWER---", 1)[-1]
+                    answer_text = answer_text.split("---CHUNKS---", 1)[0].strip()
+                    if answer_text:
+                        emitted.add("answer")
+                        yield {"event": "answer", "data": {"answer": answer_text}}
+
+            time.sleep(4)
+
+            # Stream ended — emit whatever sections never got a "next marker"
+            # (typically just CHUNKS, sometimes more if the model omitted
+            # markers near the end). Re-parse the full buffer for anything
+            # not yet emitted rather than guessing at partial boundaries.
+            full = _parse_structured_response(buffer)
+            if "summary" not in emitted and full["summary"]:
+                yield {"event": "summary", "data": {"summary": full["summary"]}}
+            if "sections" not in emitted and full["sections"]:
+                yield {"event": "sections", "data": {"sections": full["sections"]}}
+            if "answer" not in emitted:
+                yield {"event": "answer", "data": {"answer": full["answer"]}}
+            yield {"event": "chunk_blocks", "data": {"chunk_blocks": full["chunk_blocks"]}}
+            return
+
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                wait = 60 * (attempt + 1)
+                print(f"  [engine] Rate limit on stream. Waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  [engine] Streaming generation error (attempt {attempt + 1}): {e}")
+
+    yield {"event": "error", "data": {"message": "I encountered an error generating a response. Please try again."}}
+
+
 # ---------------------------------------------------------------------------
 # Public: main query function
 # ---------------------------------------------------------------------------
@@ -700,6 +869,7 @@ def _generate_answer(prompt: str, client, max_retries: int = 3) -> str:
 def query(
     question: str,
     session: Optional[dict] = None,
+    on_event=None,
 ) -> tuple[str, Optional[dict], dict]:
     """
     Process a user question end-to-end and return an answer.
@@ -709,6 +879,20 @@ def query(
     Parameters:
         question  The user's natural language question.
         session   Current session dict or None.
+        on_event  Optional callback(event: dict) for streaming. When provided,
+          the three chunk-bearing branches (cross_repo_semantic,
+          cross_repo_comparative, repo_specific) call Gemini via
+          generate_answer_stream() instead of _generate_answer(), and invoke
+          on_event(...) for each semantic event (summary/sections/answer/
+          chunk_blocks/error) AS IT ARRIVES — see generate_answer_stream's
+          docstring for the event shapes. The full answer text is still
+          accumulated and used exactly as before for session history,
+          _build_result(), etc. — every line of branch logic below this
+          point is UNCHANGED whether on_event is set or not; only the
+          generation call itself differs. When on_event is None (cli.py's
+          case), this is byte-for-byte the same as before streaming existed.
+          list_repos/cross_repo_metadata and all error/guard paths ignore
+          on_event entirely — they're fast and don't stream.
 
     Returns:
         (answer_str, updated_session, result)
@@ -733,6 +917,44 @@ def query(
     client        = get_client()
     github_client = GitHubClient(token=os.getenv("GITHUB_TOKEN"))
     active_repo   = session["active_repo"] if session else None
+
+    def _generate(prompt: str) -> str:
+        """
+        Shared generation step for the 3 chunk-bearing branches. Streams via
+        on_event when provided, otherwise calls _generate_answer exactly as
+        before. Always returns the full answer text either way, so callers
+        don't need an if/else — this is the ONLY thing that changes between
+        streaming and non-streaming mode.
+        """
+        if on_event is None:
+            return _generate_answer(prompt, client)
+
+        full_answer = ""
+        for event in generate_answer_stream(prompt, client):
+            on_event(event)
+            if event["event"] == "error":
+                return event["data"]["message"]
+            # Reconstruct the full text so downstream logic (session
+            # history, _build_result's re-parse) works unchanged. answer
+            # event carries the ---ANSWER--- section text; we still need
+            # summary/sections/chunk_blocks folded back in so
+            # _build_result's _parse_structured_response call (which
+            # re-parses the FULL text from scratch) finds all 4 markers.
+            if event["event"] == "summary":
+                full_answer += f"---SUMMARY---\n{event['data']['summary']}\n\n"
+            elif event["event"] == "sections":
+                full_answer += "---SECTIONS---\n" + "\n".join(
+                    f"[S{i+1}] {s['heading']}"
+                    for i, s in enumerate(event["data"]["sections"])
+                ) + "\n\n"
+            elif event["event"] == "answer":
+                full_answer += f"---ANSWER---\n{event['data']['answer']}\n\n"
+            elif event["event"] == "chunk_blocks":
+                full_answer += "---CHUNKS---\n" + "\n\n".join(
+                    f"[{num}] {block['heading']}\n{block['text']}"
+                    for num, block in event["data"]["chunk_blocks"].items()
+                )
+        return full_answer
 
     # Pull comparison_repos from the session (set by _new_comparison_session
     # on the previous turn, if the last question was cross_repo_comparative).
@@ -795,7 +1017,7 @@ def query(
             result["error"] = "not_indexed"
             return answer, None, result
         prompt = _build_semantic_prompt(question, chunks)
-        answer = _generate_answer(prompt, client)
+        answer = _generate(prompt)
         result = _build_result(
             "cross_repo_semantic", answer, chunks, None, None, github_client
         )
@@ -895,7 +1117,7 @@ def query(
             ranked_repos,
             comparison_history=prior_history,
         )
-        answer = _generate_answer(prompt, client)
+        answer = _generate(prompt)
 
         # Flatten all chunks from all ranked repos for the result dict
         # (plan Section 7: cross_repo_comparative chunks are "all chunks
@@ -1030,7 +1252,7 @@ def query(
         )
     else:
         prompt = _build_repo_specific_prompt(question, chunks, session)
-        answer = _generate_answer(prompt, client)
+        answer = _generate(prompt)
 
     # Append this turn to session history.
     session["conversation_history"].append(

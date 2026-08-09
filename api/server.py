@@ -12,10 +12,11 @@ CORS is open (*) for Phase 2 local development.
 Tighten in production.
 
 Endpoints (INTEGRATION_PLAN.md Section 9):
-  POST /ask     — main endpoint, calls query() and returns its result dict
-  GET  /repos   — list_all_repos(), passed through as-is
-  GET  /health  — status + indexed repo count
-  POST /reset   — clear a session by id
+  POST /ask         — non-streaming, calls query() and returns its full result dict
+  POST /ask/stream   — SSE streaming variant, see query()'s on_event docstring
+  GET  /repos        — list_all_repos(), passed through as-is
+  GET  /health        — status + indexed repo count
+  POST /reset          — clear a session by id
 """
 
 from dotenv import load_dotenv
@@ -26,8 +27,13 @@ from dotenv import load_dotenv
 # doing it here at import time, same as cli.py, covers that).
 load_dotenv()
 
+import json
+import queue
+import threading
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from uuid import uuid4
@@ -100,6 +106,69 @@ def ask(body: AskRequest):
 
     result["session_id"] = sid
     return result
+
+
+def _sse_format(event_name: str, data: dict) -> str:
+    """Format one Server-Sent Event frame."""
+    return f"event: {event_name}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/ask/stream")
+def ask_stream(body: AskRequest):
+    """
+    Streaming variant of /ask. See query()'s on_event docstring in engine.py
+    for the semantic events this proxies: summary, sections, answer,
+    chunk_blocks, error — plus a final "done" event carrying the same result
+    shape /ask returns (so a client that only handles "done" gets identical
+    behavior to /ask, and one that handles the earlier events gets
+    progressive rendering, summary-first).
+
+    engine.py's query() is synchronous (query_type routing + retrieval +
+    generation all happen inline) and on_event is a plain callback, not a
+    generator itself — so to turn this into something FastAPI can stream,
+    query() runs on a background thread and pushes events into a thread-safe
+    queue; this generator function drains that queue and yields SSE frames
+    as they arrive. This is standard practice for adapting a synchronous
+    callback-based function to an async/streaming HTTP response.
+    """
+    sid     = body.session_id or str(uuid4())
+    session = sessions.get(sid)
+
+    event_queue: "queue.Queue" = queue.Queue()
+    SENTINEL = object()
+
+    def _run():
+        try:
+            def on_event(event):
+                event_queue.put(event)
+
+            answer, updated_session, result = query(
+                body.question, session=session, on_event=on_event
+            )
+
+            if updated_session is not None:
+                sessions[sid] = updated_session
+            elif sid in sessions:
+                del sessions[sid]
+
+            result["session_id"] = sid
+            event_queue.put({"event": "done", "data": result})
+        except Exception as e:
+            event_queue.put({"event": "error", "data": {"message": str(e)}})
+        finally:
+            event_queue.put(SENTINEL)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    def _event_stream():
+        while True:
+            item = event_queue.get()
+            if item is SENTINEL:
+                break
+            yield _sse_format(item["event"], item["data"])
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
 @app.post("/reset")

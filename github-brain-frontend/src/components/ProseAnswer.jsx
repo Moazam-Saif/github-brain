@@ -1,7 +1,10 @@
+import { slugify } from './SectionNav';
+
 // Renders prose, converting inline [N] chunk references (added by
-// engine.py's CHUNK_STRUCTURE_INSTRUCTION) into clickable markers that jump
-// to that chunk in the ChunkList/SourceViewer. Falls back gracefully if a
-// [N] doesn't correspond to a real chunk (renders as plain text).
+// engine.py's RESPONSE_STRUCTURE_INSTRUCTION) into clickable markers that
+// jump to that chunk in the ChunkList/SourceViewer, and rendering "## "
+// lines as real headings with an id matching SectionNav's slugify() so
+// clicking a section nav pill scrolls to the right spot.
 const MARKER_RE = /\[(\d+)\]/g;
 
 function renderWithMarkers(text, chunks, onJump) {
@@ -37,17 +40,41 @@ function renderWithMarkers(text, chunks, onJump) {
 }
 
 export default function ProseAnswer({ answer, chunks, onJumpToChunk }) {
-  const paragraphs = (answer || '').split('\n\n').filter((p) => p.trim());
+  const blocks = (answer || '').split('\n\n').filter((p) => p.trim());
 
   return (
-    <div className="flex-1 overflow-y-auto px-2.5 py-3 flex flex-col gap-2">
-      {paragraphs.map((para, i) => (
-        <p key={i} className="text-[0.85rem] leading-[1.7] text-charcoal p-2">
-          {chunks && chunks.length > 0
-            ? renderWithMarkers(para, chunks, onJumpToChunk || (() => {}))
-            : para}
-        </p>
-      ))}
+    <div className="flex-1 overflow-y-auto px-2.5 py-3 flex flex-col gap-1">
+      {blocks.map((block, i) => {
+        const headingMatch = block.match(/^##\s+(.+)$/m);
+        if (headingMatch) {
+          const heading = headingMatch[1].trim();
+          const rest = block.replace(/^##\s+.+$/m, '').trim();
+          return (
+            <div key={i}>
+              <h4
+                id={`section-${slugify(heading)}`}
+                className="text-[0.78rem] font-bold text-charcoal px-2 pt-3 pb-1 scroll-mt-4"
+              >
+                {heading}
+              </h4>
+              {rest && (
+                <p className="text-[0.85rem] leading-[1.7] text-charcoal px-2">
+                  {chunks && chunks.length > 0
+                    ? renderWithMarkers(rest, chunks, onJumpToChunk || (() => {}))
+                    : rest}
+                </p>
+              )}
+            </div>
+          );
+        }
+        return (
+          <p key={i} className="text-[0.85rem] leading-[1.7] text-charcoal p-2">
+            {chunks && chunks.length > 0
+              ? renderWithMarkers(block, chunks, onJumpToChunk || (() => {}))
+              : block}
+          </p>
+        );
+      })}
     </div>
   );
 }

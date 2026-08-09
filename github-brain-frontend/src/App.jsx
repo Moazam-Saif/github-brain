@@ -5,15 +5,27 @@ import SummaryCard from './components/SummaryCard';
 import ChunkList from './components/ChunkList';
 import SourceViewer from './components/SourceViewer';
 import ProseAnswer from './components/ProseAnswer';
-import { fetchRepos, askQuestion, resetSession } from './api';
+import SectionNav from './components/SectionNav';
+import { fetchRepos, askQuestionStream, resetSession } from './api';
 
 export default function App() {
   const [repos, setRepos] = useState([]);
   const [sessionId, setSessionId] = useState(null);
-  const [result, setResult] = useState(null); // full /ask response
+
+  // Progressive answer state — populated incrementally as SSE events arrive,
+  // summary first (see askQuestionStream in api.js / query()'s on_event in
+  // engine.py). `result` becomes the full merged object once 'done' fires;
+  // until then these are the individual pieces so the UI can render each as
+  // soon as it lands rather than waiting for the whole response.
+  const [summary, setSummary] = useState(null);
+  const [sections, setSections] = useState([]);
+  const [answer, setAnswer] = useState(null);
+  const [result, setResult] = useState(null); // full response, set on 'done'
+
   const [selectedChunk, setSelectedChunk] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [activeRepo, setActiveRepo] = useState(null);
 
   useEffect(() => {
     fetchRepos()
@@ -24,14 +36,48 @@ export default function App() {
   async function handleAsk(question) {
     setLoading(true);
     setError(null);
+    setSummary(null);
+    setSections([]);
+    setAnswer(null);
+    setResult(null);
+    setSelectedChunk(null);
+
     try {
-      const data = await askQuestion(question, sessionId);
-      setSessionId(data.session_id);
-      setResult(data);
-      setSelectedChunk(null);
+      await askQuestionStream(question, sessionId, (eventName, data) => {
+        switch (eventName) {
+          case 'summary':
+            setSummary(data.summary);
+            break;
+          case 'sections':
+            setSections(data.sections);
+            break;
+          case 'answer':
+            setAnswer(data.answer);
+            break;
+          case 'chunk_blocks':
+            // Chunk headings/text arrive here but we don't have file/score/
+            // etc. for them yet — those only exist once 'done' ships the
+            // full chunks array (files need the GitHub fetch, which is why
+            // 'done' waits — see Option C in INTEGRATION_PROGRESS.md). No
+            // separate state needed; 'done' below is what actually
+            // populates the chunk list.
+            break;
+          case 'done':
+            setSessionId(data.session_id);
+            setActiveRepo(data.repo);
+            setResult(data);
+            setLoading(false);
+            break;
+          case 'error':
+            setError(data.message);
+            setLoading(false);
+            break;
+          default:
+            break;
+        }
+      });
     } catch (err) {
       setError(err.message);
-    } finally {
       setLoading(false);
     }
   }
@@ -43,8 +89,8 @@ export default function App() {
   async function handleAskWithReset(question) {
     if (
       result?.query_type === 'repo_specific' &&
-      result?.repo &&
-      !question.toLowerCase().includes(result.repo.toLowerCase())
+      activeRepo &&
+      !question.toLowerCase().includes(activeRepo.toLowerCase())
     ) {
       await resetSession(sessionId).catch(() => {});
       setSessionId(null);
@@ -53,15 +99,21 @@ export default function App() {
   }
 
   const hasChunks = result?.chunks && result.chunks.length > 0;
+  // Prefer the fully-merged result's answer once available (it's re-parsed
+  // from the complete text server-side, so it's authoritative); fall back to
+  // the streamed-in answer piece while still waiting on 'done'.
+  const displayAnswer = result?.answer ?? answer;
+  const displaySummary = result?.summary ?? summary;
+  const displaySections = result?.sections?.length ? result.sections : sections;
 
   return (
     <div className="min-h-screen bg-cream text-charcoal">
       <Header />
 
       <main className="max-w-[860px] mx-auto px-4 sm:px-6 pt-6 pb-12 flex flex-col gap-6">
-        <AskBar repos={repos} onAsk={handleAskWithReset} activeRepo={result?.repo} />
+        <AskBar repos={repos} onAsk={handleAskWithReset} activeRepo={activeRepo} />
 
-        <SummaryCard summary={result?.summary} />
+        <SummaryCard summary={displaySummary} />
 
         {error && (
           <p className="text-sm text-purple font-mono">Error: {error}</p>
@@ -75,7 +127,7 @@ export default function App() {
                 Answer chunks
               </h3>
               <span className="font-mono text-[0.62rem] text-muted-teal">
-                {loading
+                {loading && !hasChunks
                   ? 'Searching...'
                   : hasChunks
                   ? `${result.chunks.length} chunks`
@@ -83,32 +135,35 @@ export default function App() {
               </span>
             </div>
 
-            {loading ? (
+            {!displaySummary && !displaySections.length && !displayAnswer && loading ? (
               <p className="text-xs text-muted-teal italic text-center py-4 px-2">
                 Searching your repos...
               </p>
-            ) : !result ? (
+            ) : !displaySections.length && !displayAnswer && !result ? (
               <div className="flex-1 overflow-y-auto px-2.5 py-3">
                 <p className="text-xs text-muted-teal italic text-center py-4 px-2">
                   Select a question to see the answer broken into source chunks.
                 </p>
               </div>
-            ) : hasChunks ? (
+            ) : (
               <div className="flex-1 overflow-y-auto flex flex-col">
+                <SectionNav sections={displaySections} />
                 <ProseAnswer
-                  answer={result.answer}
-                  chunks={result.chunks}
+                  answer={displayAnswer}
+                  chunks={result?.chunks}
                   onJumpToChunk={setSelectedChunk}
                 />
-                <div className="border-t border-muted-teal/40 mx-2.5" />
-                <ChunkList
-                  chunks={result.chunks}
-                  selectedIndex={selectedChunk?.index}
-                  onSelect={setSelectedChunk}
-                />
+                {hasChunks && (
+                  <>
+                    <div className="border-t border-muted-teal/40 mx-2.5" />
+                    <ChunkList
+                      chunks={result.chunks}
+                      selectedIndex={selectedChunk?.index}
+                      onSelect={setSelectedChunk}
+                    />
+                  </>
+                )}
               </div>
-            ) : (
-              <ProseAnswer answer={result.answer} />
             )}
           </div>
 
