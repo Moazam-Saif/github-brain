@@ -27,8 +27,24 @@
 }
 
 @layer base {
+  :root {
+    /* Single source of truth for page padding, ported from the new mock's
+       --gap variable — shrinks at the same two breakpoints the mock uses
+       (768px tablet, 560px mobile), NOT Tailwind's default sm:/md: scale. */
+    --gap: 1.5rem;
+  }
+  @media (max-width: 768px) {
+    :root { --gap: 1rem; }
+  }
+  @media (max-width: 560px) {
+    :root { --gap: 0.875rem; }
+  }
+
   body {
-    @apply bg-cream text-charcoal font-sans min-h-screen;
+    @apply bg-cream text-charcoal font-sans;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
   }
 }
 

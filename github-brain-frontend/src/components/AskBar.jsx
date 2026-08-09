@@ -17,29 +17,32 @@ export default function AskBar({ repos, onAsk, activeRepo }) {
 
   return (
     <>
-      <div className="flex justify-start">
+      {/* Single row, wraps naturally; only stacks to a column at the 560px
+          mobile breakpoint, matching the mock's .ask-row exactly (the 768px
+          tablet tier doesn't touch this layout at all). */}
+      <div className="flex items-center gap-3 flex-wrap max-[560px]:flex-col max-[560px]:items-start max-[560px]:gap-2.5">
         <button
           onClick={() => setModalOpen(true)}
-          className="w-full sm:w-auto bg-bright-green text-dark-green font-mono text-sm font-bold tracking-[0.12em] uppercase px-10 py-3.5 rounded sm:min-w-[280px] text-center transition-colors hover:bg-muted-teal hover:-translate-y-px"
+          className="flex-shrink-0 bg-bright-green text-dark-green font-mono text-[0.85rem] font-bold tracking-[0.12em] uppercase px-8 py-3 rounded whitespace-nowrap transition-[background,transform] duration-150 hover:bg-muted-teal hover:-translate-y-px max-[768px]:text-[0.78rem] max-[768px]:px-[1.4rem] max-[768px]:py-[0.65rem] max-[560px]:w-full max-[560px]:text-center"
         >
           Ask Question
         </button>
-      </div>
 
-      <div className="flex gap-2 flex-wrap">
-        {repos.map((repo) => (
-          <button
-            key={repo.repo_name}
-            onClick={() => onAsk(`${repo.repo_name} — tell me about this repo`)}
-            className={`text-xs rounded-full px-3 py-1.5 border font-sans transition-colors ${
-              activeRepo === repo.repo_name
-                ? 'bg-muted-teal text-dark-green border-muted-teal'
-                : 'border-muted-teal text-charcoal hover:bg-muted-teal hover:text-dark-green'
-            }`}
-          >
-            {repo.repo_name}
-          </button>
-        ))}
+        <div className="flex gap-[0.45rem] flex-wrap items-center max-[560px]:w-full">
+          {repos.map((repo) => (
+            <button
+              key={repo.repo_name}
+              onClick={() => onAsk(`${repo.repo_name} — tell me about this repo`)}
+              className={`text-[0.73rem] rounded-full px-3 py-[0.28rem] border font-sans whitespace-nowrap transition-colors ${
+                activeRepo === repo.repo_name
+                  ? 'bg-muted-teal text-dark-green border-muted-teal'
+                  : 'border-muted-teal text-charcoal hover:bg-muted-teal hover:text-dark-green'
+              }`}
+            >
+              {repo.repo_name}
+            </button>
+          ))}
+        </div>
       </div>
 
       {modalOpen && (
@@ -47,7 +50,7 @@ export default function AskBar({ repos, onAsk, activeRepo }) {
           className="fixed inset-0 bg-dark-green/65 z-[100] flex items-center justify-center"
           onClick={(e) => e.target === e.currentTarget && setModalOpen(false)}
         >
-          <div className="bg-cream rounded-lg p-6 w-[min(540px,90vw)] flex flex-col gap-3.5">
+          <div className="bg-cream rounded-lg p-6 w-[min(540px,92vw)] flex flex-col gap-3.5">
             <h2 className="font-mono text-sm tracking-[0.1em] uppercase text-dark-green">
               Ask a question
             </h2>
@@ -58,7 +61,7 @@ export default function AskBar({ repos, onAsk, activeRepo }) {
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="Type your question…"
-              className="px-4 py-3 border border-muted-teal rounded font-sans text-sm bg-cream text-charcoal outline-none focus:border-purple"
+              className="px-4 py-3 border border-muted-teal rounded font-sans text-sm bg-cream text-charcoal outline-none focus:border-purple w-full"
             />
             <div className="flex gap-2.5 justify-end">
               <button

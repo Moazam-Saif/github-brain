@@ -107,10 +107,14 @@ export default function App() {
   const displaySections = result?.sections?.length ? result.sections : sections;
 
   return (
-    <div className="min-h-screen bg-cream text-charcoal">
+    <div className="min-h-screen flex flex-col">
       <Header />
 
-      <main className="max-w-[860px] mx-auto px-4 sm:px-6 pt-6 pb-12 flex flex-col gap-6">
+      {/* .page-body: flex:1 so it (and .cards inside it) fill all remaining
+          vertical space below the header/ticker — NOT a centered max-width
+          column. Padding driven entirely by --gap so it shrinks in step
+          with the header/summary bleed at the same breakpoints. */}
+      <main className="flex-1 flex flex-col gap-5 min-h-0 px-(--gap) pt-(--gap) pb-8">
         <AskBar repos={repos} onAsk={handleAskWithReset} activeRepo={activeRepo} />
 
         <SummaryCard summary={displaySummary} />
@@ -119,14 +123,19 @@ export default function App() {
           <p className="text-sm text-purple font-mono">Error: {error}</p>
         )}
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+        {/* .cards: grid, 1fr 1fr, flex:1 + min-height:0 so it fills the rest
+            of the page and its children can scroll internally instead of
+            growing the page. At 768px it narrows but stays side-by-side; at
+            560px it stacks to one column and stops stretching (each card
+            gets its own min/max-height instead), exactly matching the mock. */}
+        <div className="grid grid-cols-2 gap-5 flex-1 min-h-0 max-[768px]:min-h-[320px] max-[560px]:grid-cols-1 max-[560px]:flex-none">
           {/* LEFT: answer chunks or prose */}
-          <div className="rounded-md min-h-[340px] flex flex-col overflow-hidden bg-cream-dark border-[1.5px] border-muted-teal">
-            <div className="px-4.5 py-3.5 flex items-center justify-between flex-shrink-0 border-b border-muted-teal">
-              <h3 className="font-mono text-[0.68rem] tracking-[0.2em] uppercase text-charcoal">
+          <div className="rounded-md flex flex-col overflow-hidden min-h-0 bg-cream-dark border-[1.5px] border-muted-teal max-[560px]:min-h-[280px] max-[560px]:max-h-[60vh]">
+            <div className="px-[1.1rem] py-3 flex items-center justify-between flex-shrink-0 border-b border-muted-teal">
+              <h3 className="font-mono text-[0.65rem] tracking-[0.2em] uppercase text-charcoal">
                 Answer chunks
               </h3>
-              <span className="font-mono text-[0.62rem] text-muted-teal">
+              <span className="font-mono text-[0.6rem] text-muted-teal">
                 {loading && !hasChunks
                   ? 'Searching...'
                   : hasChunks
@@ -168,9 +177,9 @@ export default function App() {
           </div>
 
           {/* RIGHT: source file viewer */}
-          <div className="rounded-md min-h-[340px] flex flex-col overflow-hidden bg-purple border-[1.5px] border-bright-green">
-            <div className="px-4.5 py-3.5 flex items-center justify-between flex-shrink-0 border-b border-bright-green/20">
-              <h3 className="font-mono text-[0.68rem] tracking-[0.2em] uppercase text-bright-green">
+          <div className="rounded-md flex flex-col overflow-hidden min-h-0 bg-purple border-[1.5px] border-bright-green max-[560px]:min-h-[280px] max-[560px]:max-h-[60vh]">
+            <div className="px-[1.1rem] py-3 flex items-center justify-between flex-shrink-0 border-b border-bright-green/20">
+              <h3 className="font-mono text-[0.65rem] tracking-[0.2em] uppercase text-bright-green">
                 Source file
               </h3>
             </div>
