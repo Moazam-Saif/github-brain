@@ -1,28 +1,23 @@
-// Renders the answer's section headings as clickable jump links. Scrolls
-// to the matching "## Heading" in the rendered ProseAnswer below it via
-// element id (see ProseAnswer's heading id generation — must match).
-function slugify(heading) {
-  return heading
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '');
-}
-
-export default function SectionNav({ sections }) {
+// Topic tab bar — mirrors the Source file panel's file-tab style. One topic
+// is active at a time (index into `sections`/`sectionContent`); its body is
+// the only one shown below (see App.jsx). Auto-selects to match whichever
+// chunk/source file was just clicked (see onSelectChunk's chunk_indices
+// lookup in App.jsx) rather than scrolling, since other sections' text is
+// now hidden, not just off-screen.
+export default function SectionNav({ sections, activeIndex, onSelect }) {
   if (!sections || sections.length === 0) return null;
 
-  function handleClick(heading) {
-    const el = document.getElementById(`section-${slugify(heading)}`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-
   return (
-    <div className="flex flex-wrap gap-1.5 px-2.5 pt-2">
+    <div className="flex overflow-x-auto flex-shrink-0 border-b border-muted-teal/40 px-1">
       {sections.map((s, i) => (
         <button
           key={i}
-          onClick={() => handleClick(s.heading)}
-          className="text-[0.68rem] font-mono px-2 py-1 rounded border border-muted-teal/50 text-muted-teal hover:bg-muted-teal hover:text-dark-green transition-colors"
+          onClick={() => onSelect(i)}
+          className={`px-3 py-2 font-mono text-[0.66rem] whitespace-nowrap border-b-2 transition-colors ${
+            i === activeIndex
+              ? 'text-purple border-purple font-bold'
+              : 'text-muted-teal border-transparent hover:text-charcoal'
+          }`}
         >
           {s.heading}
         </button>
@@ -30,5 +25,3 @@ export default function SectionNav({ sections }) {
     </div>
   );
 }
-
-export { slugify };

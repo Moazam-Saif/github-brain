@@ -23,6 +23,7 @@ export default function App() {
   const [result, setResult] = useState(null); // full response, set on 'done'
 
   const [selectedChunk, setSelectedChunk] = useState(null);
+  const [activeSectionIndex, setActiveSectionIndex] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [activeRepo, setActiveRepo] = useState(null);
@@ -41,6 +42,7 @@ export default function App() {
     setAnswer(null);
     setResult(null);
     setSelectedChunk(null);
+    setActiveSectionIndex(0);
 
     try {
       await askQuestionStream(question, sessionId, (eventName, data) => {
@@ -105,6 +107,40 @@ export default function App() {
   const displayAnswer = result?.answer ?? answer;
   const displaySummary = result?.summary ?? summary;
   const displaySections = result?.sections?.length ? result.sections : sections;
+  // section_content (per-topic body + which chunk indices that topic
+  // references) only exists once 'done' ships the full result — it's
+  // computed server-side from the complete answer text, see engine.py's
+  // _split_answer_into_sections. Before that, there's nothing to slice by
+  // topic yet, so the tab bar/body just isn't shown until 'done' (the
+  // un-sliced streamed-in `answer` isn't usable for per-topic display).
+  const sectionContent = result?.section_content || [];
+  // Chunks are only real, indexed data once 'done' fires (see note in
+  // 'chunk_blocks' case above) — using result?.chunks here (not just
+  // displayAnswer's chunk markers) ensures marker clicks work as soon as
+  // they're clickable, and are correctly NON-clickable (render as plain
+  // text) before that, rather than silently doing nothing.
+  const displayChunks = result?.chunks || [];
+
+  function handleSelectChunk(chunk) {
+    setSelectedChunk(chunk);
+    // Auto-select whichever topic's body actually references this chunk's
+    // index, per the user's ask: clicking a chunk/source file should switch
+    // to its corresponding topic tab (previously this scrolled to a heading;
+    // now other topics' text is hidden, so switching tabs is the equivalent).
+    const idx = sectionContent.findIndex((s) => s.chunk_indices.includes(chunk.index));
+    if (idx !== -1) setActiveSectionIndex(idx);
+  }
+
+  function handleFileSelect(filePath) {
+    // Same auto-select, but triggered by clicking a source file tab
+    // directly rather than a chunk in the list/inline marker — find any
+    // chunk belonging to that file, then its topic, same lookup as above.
+    const chunk = displayChunks.find((c) => c.file_path === filePath);
+    if (chunk) {
+      const idx = sectionContent.findIndex((s) => s.chunk_indices.includes(chunk.index));
+      if (idx !== -1) setActiveSectionIndex(idx);
+    }
+  }
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -154,13 +190,21 @@ export default function App() {
                   Select a question to see the answer broken into source chunks.
                 </p>
               </div>
-            ) : (
+            ) : sectionContent.length > 0 ? (
+              // 'done' has landed and the answer was split into per-topic
+              // slices — show the tab bar + only the active topic's body,
+              // per the user's ask (each topic hidden behind its own tab,
+              // like the source file tabs on the right).
               <div className="flex-1 overflow-y-auto flex flex-col">
-                <SectionNav sections={displaySections} />
+                <SectionNav
+                  sections={sectionContent}
+                  activeIndex={activeSectionIndex}
+                  onSelect={setActiveSectionIndex}
+                />
                 <ProseAnswer
-                  answer={displayAnswer}
-                  chunks={result?.chunks}
-                  onJumpToChunk={setSelectedChunk}
+                  body={sectionContent[activeSectionIndex]?.body}
+                  chunks={displayChunks}
+                  onJumpToChunk={handleSelectChunk}
                 />
                 {hasChunks && (
                   <>
@@ -172,6 +216,17 @@ export default function App() {
                     />
                   </>
                 )}
+              </div>
+            ) : (
+              // Mid-stream: summary/sections/answer text has arrived but
+              // 'done' hasn't landed yet, so section_content (the per-topic
+              // split) doesn't exist yet. Show the raw streamed-in answer
+              // as one block for now — it'll be replaced by the tabbed view
+              // above the moment 'done' fires. Chunks aren't real/indexed
+              // yet either at this point, so markers render as plain text
+              // (not clickable) until then — see displayChunks above.
+              <div className="flex-1 overflow-y-auto flex flex-col">
+                <ProseAnswer body={displayAnswer} chunks={displayChunks} onJumpToChunk={handleSelectChunk} />
               </div>
             )}
           </div>
@@ -188,6 +243,8 @@ export default function App() {
                 files={result.files}
                 chunks={result.chunks}
                 selectedChunk={selectedChunk}
+                onFileSelect={handleFileSelect}
+                onSelectChunk={handleSelectChunk}
               />
             ) : (
               <div className="flex flex-col items-center justify-center flex-1 p-8 gap-2.5">

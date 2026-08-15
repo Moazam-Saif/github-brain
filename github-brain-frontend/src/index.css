@@ -1,10 +1,16 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&display=swap');
 @import "tailwindcss";
 
 /*
   Palette, fonts, and highlight tokens ported 1:1 from the original
   index.html mock's :root custom properties — see INTEGRATION_PROGRESS.md
   for why these are treated as fixed design decisions, not re-derived.
+
+  --font-reading is NEW: a warmer, book-like serif used specifically for
+  longer prose the user actually reads start-to-finish (the answer text,
+  chunk summary popups) — per user feedback that Inter at UI sizes felt
+  poor for comfortable reading. Inter (--font-sans) stays for UI chrome:
+  buttons, tabs, labels, headings, anything short/scannable rather than read.
 */
 @theme {
   --color-muted-teal:   #80aea0;
@@ -22,8 +28,9 @@
   --color-hl-c-bg: rgba(138,234,146,.15);
   --color-hl-c-bd: rgba(80,160,80,.40);
 
-  --font-mono: 'Space Mono', monospace;
-  --font-sans: 'Inter', sans-serif;
+  --font-mono:    'Space Mono', monospace;
+  --font-sans:    'Inter', sans-serif;
+  --font-reading: 'Source Serif 4', Georgia, serif;
 }
 
 @layer base {
@@ -59,12 +66,14 @@
 }
 
 /* ── Syntax token colours — ported from index.html's .tok-* classes ── */
-.tok-kw   { color: #ffffff; font-weight: 700; }
-.tok-str  { color: var(--color-bright-green); }
-.tok-cmt  { color: rgba(255,255,255,.32); font-style: italic; }
-.tok-fn   { color: var(--color-bright-green); opacity: .85; }
-.tok-num  { color: #ffffff; }
-.tok-prop { color: var(--color-muted-teal); }
+.tok-kw     { color: #ffffff; font-weight: 700; }
+.tok-return { color: var(--color-muted-teal); font-weight: 700; }
+.tok-str    { color: var(--color-bright-green); }
+.tok-cmt    { color: rgba(255,255,255,.32); font-style: italic; }
+.tok-fn     { color: var(--color-bright-green); opacity: .85; }
+.tok-fn-def { color: #ffffff; font-weight: 700; }
+.tok-num    { color: #ffffff; }
+.tok-prop   { color: var(--color-muted-teal); }
 .tok-punc { color: rgba(255,255,255,.38); }
 
 /* ── Line-highlight row backgrounds — can't express rgba mixes cleanly as

@@ -638,6 +638,53 @@ def _parse_section_headings_fallback(sections_text: str) -> list[dict]:
     return headings
 
 
+def _split_answer_into_sections(answer: str, section_list: list[dict]) -> list[dict]:
+    """
+    Split the ---ANSWER--- text into per-section slices, keyed by its own
+    "## Heading" markdown lines — NOT by re-asking Gemini for anything new,
+    just parsing structure that's already there (the RESPONSE_STRUCTURE_INSTRUCTION
+    prompt already asks for section headings in ---ANSWER--- to match
+    ---SECTIONS---).
+
+    Returns a list of:
+      {"heading": str, "body": str, "chunk_indices": [int, ...]}
+    in the same order as `section_list` (falls back to the order headings
+    actually appear in `answer` if that differs — e.g. Gemini reordered or
+    dropped one; safer than assuming perfect agreement between the two
+    independently-parsed parts of the same response).
+
+    chunk_indices are which [N] markers appear in that section's own body
+    text — this is what SourceViewer/App.jsx use to auto-select a topic tab
+    when a chunk/source file is clicked (see INTEGRATION_PROGRESS.md's
+    "topics horizontal bar" entry).
+
+    If ---ANSWER--- has no "## " headings at all (total malformation),
+    returns a single section with an empty heading and the whole answer as
+    its body — the frontend's tab bar just won't render in that case and it
+    falls back to showing the answer as one block, same partial-degrade
+    philosophy as everywhere else in this file.
+    """
+    HEADING_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
+    matches = list(HEADING_RE.finditer(answer))
+
+    if not matches:
+        return [{"heading": "", "body": answer.strip(), "chunk_indices": []}]
+
+    slices = []
+    for i, m in enumerate(matches):
+        heading    = m.group(1).strip()
+        body_start = m.end()
+        body_end   = matches[i + 1].start() if i + 1 < len(matches) else len(answer)
+        body       = answer[body_start:body_end].strip()
+        chunk_indices = sorted({int(n) for n in re.findall(r"\[(\d+)\]", body)})
+        slices.append({
+            "heading": heading,
+            "body": body,
+            "chunk_indices": chunk_indices,
+        })
+    return slices
+
+
 def _build_result(
     query_type: str,
     answer: str,
@@ -717,15 +764,18 @@ def _build_result(
                     "lines":    content.splitlines() if content else [],
                 }
 
+    section_content = _split_answer_into_sections(parsed["answer"], parsed["sections"])
+
     return {
-        "query_type":    query_type,
-        "repo":          repo,
-        "answer":        parsed["answer"],
-        "summary":       parsed["summary"] or _fallback_summary(parsed["answer"]),
-        "sections":      parsed["sections"],
-        "chunks":        chunk_items,
-        "files":         files,
-        "repo_metadata": repo_metadata,
+        "query_type":       query_type,
+        "repo":             repo,
+        "answer":           parsed["answer"],
+        "summary":          parsed["summary"] or _fallback_summary(parsed["answer"]),
+        "sections":         parsed["sections"],
+        "section_content":  section_content,
+        "chunks":           chunk_items,
+        "files":            files,
+        "repo_metadata":    repo_metadata,
     }
 
 
