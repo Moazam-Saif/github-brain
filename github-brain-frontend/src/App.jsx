@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react';
 import Header from './components/Header';
 import AskBar from './components/AskBar';
 import SummaryCard from './components/SummaryCard';
-import ChunkList from './components/ChunkList';
 import SourceViewer from './components/SourceViewer';
 import ProseAnswer from './components/ProseAnswer';
 import SectionNav from './components/SectionNav';
@@ -23,6 +22,11 @@ export default function App() {
   const [result, setResult] = useState(null); // full response, set on 'done'
 
   const [selectedChunk, setSelectedChunk] = useState(null);
+  // Set by clicking an inline code reference (e.g. `request.form.get`) in
+  // the answer prose — jumps the source viewer to an exact file+line that
+  // isn't necessarily inside any chunk's estimated highlight range, so it's
+  // tracked separately from selectedChunk rather than overloading it.
+  const [jumpTarget, setJumpTarget] = useState(null);
   const [activeSectionIndex, setActiveSectionIndex] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -42,6 +46,7 @@ export default function App() {
     setAnswer(null);
     setResult(null);
     setSelectedChunk(null);
+    setJumpTarget(null);
     setActiveSectionIndex(0);
 
     try {
@@ -121,22 +126,33 @@ export default function App() {
   // text) before that, rather than silently doing nothing.
   const displayChunks = result?.chunks || [];
 
-  function handleSelectChunk(chunk) {
+  function handleJumpToSource(chunk) {
+    // Used by inline [N] markers. Per the user's ask: this moves the source
+    // file panel ONLY — it must NOT change which topic/section is currently
+    // showing in the answer panel (previously this also called
+    // setActiveSectionIndex, which visibly changed the answer view out from
+    // under the reader).
     setSelectedChunk(chunk);
-    // Auto-select whichever topic's body actually references this chunk's
-    // index, per the user's ask: clicking a chunk/source file should switch
-    // to its corresponding topic tab (previously this scrolled to a heading;
-    // now other topics' text is hidden, so switching tabs is the equivalent).
-    const idx = sectionContent.findIndex((s) => s.chunk_indices.includes(chunk.index));
-    if (idx !== -1) setActiveSectionIndex(idx);
+    setJumpTarget(null);
+  }
+
+  function handleJumpToLine(filePath, lineNumber) {
+    // Used by inline code-reference clicks (e.g. `request.form.get`) — an
+    // exact file+line match found by searching fetched file content client-
+    // side (see ProseAnswer's findCodeReference), independent of any
+    // chunk's estimated highlight range. Also does not touch the topic tab.
+    setJumpTarget({ filePath, lineNumber });
   }
 
   function handleFileSelect(filePath) {
-    // Same auto-select, but triggered by clicking a source file tab
-    // directly rather than a chunk in the list/inline marker — find any
-    // chunk belonging to that file, then its topic, same lookup as above.
+    // Triggered by clicking a source file tab directly. This is a
+    // deliberate "I want to look at this file" action rather than an
+    // inline reference click mid-read, so switching the topic tab to match
+    // still makes sense here (unlike handleJumpToSource above).
     const chunk = displayChunks.find((c) => c.file_path === filePath);
     if (chunk) {
+      setSelectedChunk(chunk);
+      setJumpTarget(null);
       const idx = sectionContent.findIndex((s) => s.chunk_indices.includes(chunk.index));
       if (idx !== -1) setActiveSectionIndex(idx);
     }
@@ -204,18 +220,11 @@ export default function App() {
                 <ProseAnswer
                   body={sectionContent[activeSectionIndex]?.body}
                   chunks={displayChunks}
-                  onJumpToChunk={handleSelectChunk}
+                  files={result?.files}
+                  preferredFile={selectedChunk?.file_path}
+                  onJumpToChunk={handleJumpToSource}
+                  onJumpToLine={handleJumpToLine}
                 />
-                {hasChunks && (
-                  <>
-                    <div className="border-t border-muted-teal/40 mx-2.5" />
-                    <ChunkList
-                      chunks={result.chunks}
-                      selectedIndex={selectedChunk?.index}
-                      onSelect={setSelectedChunk}
-                    />
-                  </>
-                )}
               </div>
             ) : (
               // Mid-stream: summary/sections/answer text has arrived but
@@ -226,7 +235,7 @@ export default function App() {
               // yet either at this point, so markers render as plain text
               // (not clickable) until then — see displayChunks above.
               <div className="flex-1 overflow-y-auto flex flex-col">
-                <ProseAnswer body={displayAnswer} chunks={displayChunks} onJumpToChunk={handleSelectChunk} />
+                <ProseAnswer body={displayAnswer} chunks={displayChunks} onJumpToChunk={handleJumpToSource} />
               </div>
             )}
           </div>
@@ -243,8 +252,9 @@ export default function App() {
                 files={result.files}
                 chunks={result.chunks}
                 selectedChunk={selectedChunk}
+                jumpTarget={jumpTarget}
                 onFileSelect={handleFileSelect}
-                onSelectChunk={handleSelectChunk}
+                onSelectChunk={handleJumpToSource}
               />
             ) : (
               <div className="flex flex-col items-center justify-center flex-1 p-8 gap-2.5">

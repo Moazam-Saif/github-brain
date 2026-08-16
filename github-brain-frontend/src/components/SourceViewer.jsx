@@ -20,13 +20,17 @@ function estimateLineRange(chunk, allChunks, totalLines) {
   return { startLine, endLine };
 }
 
-export default function SourceViewer({ files, chunks, selectedChunk, onFileSelect, onSelectChunk }) {
+export default function SourceViewer({ files, chunks, selectedChunk, jumpTarget, onFileSelect, onSelectChunk }) {
   const fileKeys = Object.keys(files || {});
   const [activeKey, setActiveKey] = useState(fileKeys[0] || null);
   // Which chunk's hover popup is currently open, by chunk index — not tied
   // to selectedChunk, since EVERY chunk in the file gets its own hoverable
   // icon now, not just the selected one.
   const [openInfoIndex, setOpenInfoIndex] = useState(null);
+  // Briefly-flashed line from a jumpTarget (inline code-reference click) —
+  // separate from chunk-based highlighting since a code reference doesn't
+  // necessarily fall inside any chunk's estimated range.
+  const [flashLine, setFlashLine] = useState(null);
 
   function selectFile(key) {
     setActiveKey(key);
@@ -39,6 +43,18 @@ export default function SourceViewer({ files, chunks, selectedChunk, onFileSelec
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChunk, files]);
+
+  useEffect(() => {
+    if (jumpTarget?.filePath && files[jumpTarget.filePath]) {
+      selectFile(jumpTarget.filePath);
+      setFlashLine(jumpTarget.lineNumber);
+      const el = document.getElementById(`src-line-${jumpTarget.lineNumber}`);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const timer = setTimeout(() => setFlashLine(null), 2200);
+      return () => clearTimeout(timer);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpTarget, files]);
 
   useEffect(() => {
     if (!activeKey && fileKeys.length > 0) selectFile(fileKeys[0]);
@@ -127,17 +143,29 @@ export default function SourceViewer({ files, chunks, selectedChunk, onFileSelec
                 const sideBorder   = range ? `border-dotted ${borderClass}` : '';
                 const hasInfo = chunk && (chunk.heading || chunk.text);
                 const infoOpen = hasInfo && openInfoIndex === chunk.index;
+                const isFlashing = flashLine === lineNum;
 
                 return (
-                  <tr key={lineNum} className={rowClass}>
+                  <tr
+                    key={lineNum}
+                    id={`src-line-${lineNum}`}
+                    className={`${rowClass} ${isFlashing ? 'bg-bright-green/30 transition-colors duration-500' : ''}`}
+                  >
                     <td
-                      className={`ln text-white/18 text-right select-none min-w-[28px] pr-3.5 border-r border-white/[0.08] py-px px-2.5 relative ${topBorder} ${bottomBorder} ${
+                      className={`ln text-white/18 text-right select-none min-w-[28px] pr-3.5 border-r border-white/[0.08] py-px px-2.5 ${topBorder} ${bottomBorder} ${
                         range ? `border-l-2 ${sideBorder}` : ''
+                      }`}
+                    >
+                      {lineNum}
+                    </td>
+                    <td
+                      className={`text-white/55 whitespace-pre py-px px-2.5 relative ${topBorder} ${bottomBorder} ${
+                        range ? `border-r-2 ${sideBorder}` : ''
                       }`}
                     >
                       {isFirstInRange && hasInfo && (
                         <div
-                          className="absolute -top-1.5 -left-1.5 z-10"
+                          className="absolute -top-1.5 -right-1.5 z-10"
                           onMouseEnter={() => setOpenInfoIndex(chunk.index)}
                           onMouseLeave={() => setOpenInfoIndex(null)}
                         >
@@ -151,14 +179,14 @@ export default function SourceViewer({ files, chunks, selectedChunk, onFileSelec
                             </span>
                           </button>
                           {infoOpen && (
-                            <div className="absolute top-4 left-0 w-72 bg-white border border-purple/20 rounded-md shadow-lg p-3.5 z-20">
+                            <div className="absolute top-4 right-0 w-72 bg-white border border-black/10 rounded-md shadow-lg p-3.5 z-20">
                               {chunk.heading && (
-                                <div className="font-sans text-[0.8rem] font-bold text-purple mb-1.5 leading-snug">
+                                <div className="font-sans text-[0.8rem] font-bold text-[#2a2a2a] mb-1.5 leading-snug">
                                   {chunk.heading}
                                 </div>
                               )}
                               {chunk.text && (
-                                <div className="font-reading text-[0.86rem] leading-[1.6] text-purple">
+                                <div className="font-reading text-[0.86rem] leading-[1.6] text-[#3a3a3a]">
                                   {chunk.text}
                                 </div>
                               )}
@@ -166,13 +194,6 @@ export default function SourceViewer({ files, chunks, selectedChunk, onFileSelec
                           )}
                         </div>
                       )}
-                      {lineNum}
-                    </td>
-                    <td
-                      className={`text-white/55 whitespace-pre py-px px-2.5 ${topBorder} ${bottomBorder} ${
-                        range ? `border-r-2 ${sideBorder}` : ''
-                      }`}
-                    >
                       {tokenizeLine(line).map((seg, si) =>
                         seg.cls ? (
                           <span key={si} className={seg.cls}>
