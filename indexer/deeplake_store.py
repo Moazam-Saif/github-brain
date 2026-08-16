@@ -83,10 +83,20 @@ DELETION STRATEGY (rewrite-in-place, not ds.pop()):
 import os
 import re
 import json
+import time
+import contextlib
 import numpy as np
 import deeplake
 from rank_bm25 import BM25Okapi
 from typing import Optional
+
+
+@contextlib.contextmanager
+def _timed(label: str):
+    """TEMPORARY diagnostic timer — see engine.py's _timed for context."""
+    start = time.time()
+    yield
+    print(f"    [TIMING] {label}: {time.time() - start:.2f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +181,14 @@ def store_chunks(chunks: list[dict]) -> int:
             count += 1
 
     print(f"  [deeplake] Stored {count} chunks.")
+    # NOTE: invalidate_cache() here only helps if store_chunks() runs in the
+    # SAME process as the cache (e.g. if indexing is ever triggered via an
+    # API endpoint in the future). Today, `cli.py index` runs as a separate
+    # process from `api/server.py`'s uvicorn process — they don't share
+    # memory, so this call has no effect on a running server's cache. You
+    # must restart uvicorn after re-indexing for it to pick up new data.
+    # Calling it anyway costs nothing and future-proofs this function.
+    invalidate_cache()
     return count
 
 
@@ -234,74 +252,160 @@ def delete_repo_chunks(repo_name: str) -> int:
 
     print(f"  [deeplake] Deleted {deleted_count} chunks for repo: {repo_name} "
           f"({len(kept_texts)} chunks from other repos preserved)")
+    # Same cross-process caveat as store_chunks() — see its comment. This
+    # function also fully rewrites the dataset file, so if it ever DOES run
+    # in the same process as a warm cache, invalidating is essential (not
+    # just a nice-to-have) since the cache would otherwise reference stale
+    # embeddings from before the rewrite.
+    invalidate_cache()
     return deleted_count
 
 
 # ---------------------------------------------------------------------------
-# Read: load all data (internal)
+# Read: load all data (internal) — CACHED
 # ---------------------------------------------------------------------------
+#
+# WHY: diagnostic timing (see INTEGRATION_PROGRESS.md "retrieval speed"
+# investigation) showed _load_all() was being called 2+ times per request
+# (once for list_all_repos(), again inside hybrid_search()), each time
+# re-fetching and re-parsing ALL rows from Deep Lake — ~20-35+ seconds per
+# call on a 559-row/20-repo dataset, even when a query only needed ~30 rows
+# from one repo. The per-row Python loops (unwrapping each text/metadata
+# sample individually) are the expensive part, not the actual search math
+# (cosine + BM25 measured at 0.01-0.02s once data is in memory).
+#
+# FIX: cache the full, unfiltered dataset (embeddings/texts/metas for EVERY
+# row) in module-level globals after the first load. Every subsequent call
+# in this process — regardless of repo_name filter — reuses the cached
+# arrays and just does cheap in-memory filtering, no Deep Lake I/O.
+#
+# INVALIDATION: there is currently no automatic invalidation. Re-indexing
+# (cli.py index --mode full/repo) runs as a SEPARATE process from
+# api/server.py, so a running server has no way to know the underlying
+# Deep Lake data changed. You MUST restart uvicorn after re-indexing for
+# it to see the new data — this matches how you already restart it after
+# code changes, so it's not a new operational step, just something to keep
+# in mind. (An explicit /reload endpoint or file-mtime check would remove
+# this requirement if it becomes annoying — flag it if so.)
+#
+# CONCURRENCY: FastAPI/uvicorn can serve requests on multiple threads
+# (each sync endpoint runs in a thread pool). A lock ensures that if two
+# requests hit a cold cache at the same time, only one actually pays the
+# Deep Lake load cost — the other waits for it to finish and then reads
+# the now-populated cache, rather than both independently reloading
+# everything (exactly the pileup visible in the timing log: multiple
+# concurrent /repos and /ask calls each triggering their own full load).
+
+import threading
+
+_cache_lock = threading.Lock()
+_cache: dict = {
+    "embeddings": None,   # np.ndarray (N, 768) or None if not yet loaded
+    "texts": None,        # list[str] or None
+    "metas": None,        # list[dict] or None
+}
+
+
+def invalidate_cache():
+    """
+    Clear the in-memory dataset cache. Not currently called anywhere
+    automatically — exists so a future /reload endpoint (or a manual call
+    right after re-indexing, if you add indexing as an API-triggered
+    action rather than a separate cli.py process) can force a fresh load
+    without restarting the whole server.
+    """
+    with _cache_lock:
+        _cache["embeddings"] = None
+        _cache["texts"] = None
+        _cache["metas"] = None
+    print("  [deeplake] Cache invalidated — next call will reload from Deep Lake.")
+
+
+def _load_all_uncached() -> tuple[np.ndarray, list[str], list[dict]]:
+    """
+    The actual Deep Lake fetch — every row, no filtering. Only ever called
+    by _load_all() when the cache is empty; never call this directly for
+    a per-repo query, since it always loads everything.
+    """
+    ds    = get_or_create_dataset()
+    total = len(ds)
+    print(f"    [TIMING] _load_all_uncached(): dataset has {total} rows")
+
+    if total == 0:
+        return np.array([]), [], []
+
+    try:
+        with _timed(f"_load_all_uncached: ds.embedding.numpy() bulk load ({total} rows)"):
+            all_embeddings = ds.embedding.numpy()
+
+        with _timed(f"_load_all_uncached: text loop, per-row unwrap ({total} rows)"):
+            all_texts = []
+            for _, sample in enumerate(ds.text):
+                raw = sample.numpy()
+                if hasattr(raw, "item"):
+                    raw = raw.item()
+                elif hasattr(raw, "__len__") and len(raw) == 1:
+                    raw = raw[0]
+                all_texts.append(str(raw))
+
+        with _timed(f"_load_all_uncached: metadata loop, per-row unwrap+json.loads ({total} rows)"):
+            all_metas = []
+            for _, sample in enumerate(ds.metadata):
+                try:
+                    raw = sample.numpy()
+                    if hasattr(raw, "item"):
+                        raw = raw.item()
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8")
+                    all_metas.append(json.loads(str(raw)))
+                except Exception:
+                    all_metas.append({})
+
+    except Exception as e:
+        print(f"  [deeplake] Error loading data: {e}")
+        return np.array([]), [], []
+
+    return all_embeddings, all_texts, all_metas
+
 
 def _load_all(repo_name: Optional[str] = None) -> tuple[np.ndarray, list[str], list[dict]]:
     """
-    Load all embeddings, texts, and metadata from the dataset in one pass.
+    Return embeddings/texts/metas, optionally filtered to one repo.
 
-    FIX 3 — fast iterator for text and metadata:
-      The original implementation indexed by integer in a for loop:
-        all_texts = [str(ds.text[i].numpy()) for i in range(total)]
-      Deep Lake warns this is slow and recommends enumerate(ds.tensor) instead,
-      which uses the optimised iterator path with prefetching.
-
-      Embeddings already used ds.embedding.numpy() (bulk matrix load) which
-      was already optimal and is unchanged.
+    Uses the module-level cache: the first call in this process pays the
+    full Deep Lake load cost (see _load_all_uncached), every call after
+    that — for ANY repo_name, including None — reuses the cached full
+    dataset and just does in-memory list/array filtering, which is fast
+    regardless of dataset size (measured at ~0.01s for the actual
+    cosine+BM25 math on 559 rows; the cost was always the I/O, not the
+    filtering).
 
     Returns:
         embeddings  np.ndarray shape (N, 768)
         texts       list of N strings
         metas       list of N metadata dicts
     """
-    ds    = get_or_create_dataset()
-    total = len(ds)
-
-    if total == 0:
-        return np.array([]), [], []
-
-    try:
-        # Bulk load embeddings — one network call, returns full matrix.
-        all_embeddings = ds.embedding.numpy()   # shape: (total, 768)
-
-        # FIX 3: use enumerate(ds.text) instead of ds.text[i] in a range loop.
-        # Deep Lake's iterator is significantly faster than integer indexing.
-        all_texts = [str(sample.numpy()) for _, sample in enumerate(ds.text)]
-
-        # FIX 3: same for metadata.
-        all_metas = []
-        for _, sample in enumerate(ds.metadata):
-            try:
-                raw = sample.numpy()
-                if hasattr(raw, "item"):
-                    raw = raw.item()
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-                all_metas.append(json.loads(str(raw)))
-            except Exception:
-                all_metas.append({})
-
-    except Exception as e:
-        print(f"  [deeplake] Error loading data: {e}")
-        return np.array([]), [], []
+    with _cache_lock:
+        if _cache["embeddings"] is None:
+            embeddings, texts, metas = _load_all_uncached()
+            _cache["embeddings"] = embeddings
+            _cache["texts"] = texts
+            _cache["metas"] = metas
+        else:
+            print("    [TIMING] _load_all(): cache hit, no Deep Lake I/O")
+            embeddings, texts, metas = _cache["embeddings"], _cache["texts"], _cache["metas"]
 
     if repo_name is None:
-        return all_embeddings, all_texts, all_metas
+        return embeddings, texts, metas
 
-    indices = [i for i, m in enumerate(all_metas)
-               if m.get("repo_name") == repo_name]
+    indices = [i for i, m in enumerate(metas) if m.get("repo_name") == repo_name]
 
     if not indices:
         return np.array([]), [], []
 
-    filtered_embeddings = all_embeddings[indices]
-    filtered_texts      = [all_texts[i] for i in indices]
-    filtered_metas      = [all_metas[i] for i in indices]
+    filtered_embeddings = embeddings[indices]
+    filtered_texts      = [texts[i] for i in indices]
+    filtered_metas      = [metas[i] for i in indices]
 
     return filtered_embeddings, filtered_texts, filtered_metas
 
@@ -408,7 +512,8 @@ def hybrid_search(
     Note: RRF scores are rank-fusion scores (typically 0.01–0.04), not
     cosine similarities. Higher is still better.
     """
-    embeddings, texts, metas = _load_all(repo_name=repo_name)
+    with _timed("hybrid_search: _load_all(repo_name=...)"):
+        embeddings, texts, metas = _load_all(repo_name=repo_name)
 
     if len(embeddings) == 0:
         print(f"  [deeplake] No chunks found"
@@ -416,23 +521,27 @@ def hybrid_search(
         return []
 
     n = len(texts)
+    print(f"    [TIMING] hybrid_search: searching over {n} chunks"
+          + (f" (filtered to repo={repo_name})" if repo_name else " (ALL repos)"))
 
     # --- Dense scores (cosine similarity) ---
-    query_np   = np.array(query_vector, dtype=np.float32)
-    query_norm = np.linalg.norm(query_np)
-    if query_norm == 0:
-        return []
-    query_np = query_np / query_norm
+    with _timed("hybrid_search: cosine similarity (numpy)"):
+        query_np   = np.array(query_vector, dtype=np.float32)
+        query_norm = np.linalg.norm(query_np)
+        if query_norm == 0:
+            return []
+        query_np = query_np / query_norm
 
-    norms        = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms        = np.where(norms == 0, 1, norms)
-    normalized   = embeddings / norms
-    dense_scores = normalized @ query_np   # shape (N,)
+        norms        = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms        = np.where(norms == 0, 1, norms)
+        normalized   = embeddings / norms
+        dense_scores = normalized @ query_np   # shape (N,)
 
     # --- Sparse scores (BM25) ---
     # FIX 1: use _tokenize() instead of .lower().split() for both
     # the corpus index and the query tokens.
-    bm25          = _build_bm25_index(texts)
+    with _timed(f"hybrid_search: _build_bm25_index() from scratch ({n} docs)"):
+        bm25          = _build_bm25_index(texts)
     query_tokens  = _tokenize(query_text)
     sparse_scores = np.array(
         bm25.get_scores(query_tokens),

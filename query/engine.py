@@ -85,6 +85,22 @@ from query.retriever import (retrieve_cross_repo_metadata,
 from indexer.deeplake_store import list_all_repos
 from indexer.github_client  import GitHubClient
 
+import contextlib
+
+@contextlib.contextmanager
+def _timed(label: str):
+    """
+    TEMPORARY diagnostic timer — prints how long a block took. Added to
+    find the real source of the "one query takes 5 minutes" report (see
+    INTEGRATION_PROGRESS.md) before proposing any performance fix, rather
+    than guessing. Safe to leave in permanently (negligible overhead) or
+    strip out once the bottleneck is identified and fixed.
+    """
+    start = time.time()
+    yield
+    elapsed = time.time() - start
+    print(f"  [TIMING] {label}: {elapsed:.2f}s")
+
 # Default branch used when fetching file content for the result dict.
 # Neither list_all_repos() nor per-chunk metadata carry a branch field
 # today, so there's nothing more specific to use. If get_file_content()
@@ -1217,7 +1233,8 @@ def query(
         all_repos = session["all_repos_cache"]
         print(f"[engine] Using cached repo list ({len(all_repos)} repos)")
     else:
-        all_repos = list_all_repos()
+        with _timed("list_all_repos() [full _load_all scan]"):
+            all_repos = list_all_repos()
         print(f"[engine] Fetched repo list ({len(all_repos)} repos)")
 
     # FIX 6: Guard against empty repo list — log clearly and return informative error.
@@ -1284,16 +1301,18 @@ def query(
         print(f"[engine] Continuing session: {repo_name}")
 
     # Compress old history if needed.
-    session = _manage_context_window(session, client)
+    with _timed("_manage_context_window()"):
+        session = _manage_context_window(session, client)
 
     # Retrieve relevant chunks via hybrid search + re-rank.
     # seen_chunk_ids is the capped deque from the session (FIX 7).
-    chunks = retrieve_repo_specific(
-        question=question,
-        repo_name=repo_name,
-        conversation_history=session["conversation_history"],
-        seen_chunk_ids=session["seen_chunk_ids"],
-    )
+    with _timed("retrieve_repo_specific() [enrich+HyDE+embed+hybrid_search+rerank]"):
+        chunks = retrieve_repo_specific(
+            question=question,
+            repo_name=repo_name,
+            conversation_history=session["conversation_history"],
+            seen_chunk_ids=session["seen_chunk_ids"],
+        )
 
     if not chunks:
         answer = (
@@ -1302,7 +1321,8 @@ def query(
         )
     else:
         prompt = _build_repo_specific_prompt(question, chunks, session)
-        answer = _generate(prompt)
+        with _timed("_generate() [Gemini answer generation, streamed or not]"):
+            answer = _generate(prompt)
 
     # Append this turn to session history.
     session["conversation_history"].append(
@@ -1312,8 +1332,9 @@ def query(
         {"role": "assistant", "content": answer}
     )
 
-    result = _build_result(
-        "repo_specific", answer, chunks, repo_name,
-        session.get("repo_metadata"), github_client
-    )
+    with _timed("_build_result() [GitHub file fetch + response parsing]"):
+        result = _build_result(
+            "repo_specific", answer, chunks, repo_name,
+            session.get("repo_metadata"), github_client
+        )
     return answer, session, result

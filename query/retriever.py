@@ -113,6 +113,8 @@ TOP-K VALUES:
 
 import hashlib
 import os
+import time
+import contextlib
 import requests
 from collections import deque
 from typing import Optional
@@ -380,6 +382,14 @@ def _generate_hyde_query(question: str, repo_name: str, enriched: str) -> str:
 
 
 
+@contextlib.contextmanager
+def _timed(label: str):
+    """TEMPORARY diagnostic timer — see engine.py's _timed for context."""
+    start = time.time()
+    yield
+    print(f"  [TIMING] {label}: {time.time() - start:.2f}s")
+
+
 def _chunk_id(chunk: dict) -> str:
     """
     Stable ID for a chunk: hash of repo_name + file_path + chunk_index.
@@ -643,22 +653,26 @@ def retrieve_repo_specific(
 
     Returns fresh chunk dicts sorted by re-rank score descending.
     """
-    enriched     = _build_enriched_query(question, conversation_history)
-    hyde_query   = _generate_hyde_query(question, repo_name, enriched)
+    with _timed("  _build_enriched_query()"):
+        enriched     = _build_enriched_query(question, conversation_history)
+    with _timed("  _generate_hyde_query() [Gemini call]"):
+        hyde_query   = _generate_hyde_query(question, repo_name, enriched)
     print(f"  [retriever] Repo-specific hybrid search in '{repo_name}'")
 
-    query_vector = embed_query(hyde_query)
+    with _timed("  embed_query() [embedding API call]"):
+        query_vector = embed_query(hyde_query)
     if query_vector is None:
         print("  [retriever] Failed to embed query.")
         return []
 
     # Step 3: Hybrid search — fetch TOP_K_HYBRID_FETCH candidates.
-    raw = hybrid_search(
-        query_vector=query_vector,
-        query_text=hyde_query,
-        top_k=TOP_K_HYBRID_FETCH,
-        repo_name=repo_name,
-    )
+    with _timed("  hybrid_search() [_load_all scan + BM25 build + cosine + RRF]"):
+        raw = hybrid_search(
+            query_vector=query_vector,
+            query_text=hyde_query,
+            top_k=TOP_K_HYBRID_FETCH,
+            repo_name=repo_name,
+        )
 
     if not raw:
         return []
@@ -670,7 +684,8 @@ def retrieve_repo_specific(
     # than a hypothetical code snippet which may use different naming than
     # the actual chunks. HyDE's value is in the embedding space; once we
     # have the candidates, the reranker works better with the original intent.
-    reranked = _rerank(enriched, raw)
+    with _timed("  _rerank() [Jina API call]"):
+        reranked = _rerank(enriched, raw)
 
     # Step 5: Deduplicate against seen_chunk_ids.
     # FIX 7: seen_chunk_ids is a deque with maxlen=SEEN_CHUNK_MAXLEN.
