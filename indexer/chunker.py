@@ -210,29 +210,93 @@ def _build_short_header(file_path: str, role: Optional[str]) -> str:
 # Core chunking logic
 # ---------------------------------------------------------------------------
 
-def _split_into_chunks(text: str) -> list[str]:
+def _split_into_chunks(text: str) -> list[dict]:
     """
-    Split a text string into overlapping character-window chunks.
+    Split a text string into overlapping character-window chunks, tracking
+    the real 1-indexed line range each chunk spans in the ORIGINAL file.
+
+    Added to support exact-line reference linking (see
+    INTEGRATION_PROGRESS.md "how the text is going to be connected to the
+    source files" discussion) — previously chunks only carried a
+    chunk_index (position within file), and the frontend had to GUESS a
+    line range by assuming chunks are evenly distributed across the file
+    (Strategy A). That guess was often wrong, especially for files with
+    uneven code density. This gives the real answer instead.
 
     Uses a sliding window of CHUNK_SIZE_CHARS with a step of
     (CHUNK_SIZE_CHARS - OVERLAP_CHARS) so consecutive chunks share
-    OVERLAP_CHARS characters of content.
+    OVERLAP_CHARS characters of content — window mechanics are UNCHANGED
+    from before; this only adds line-number bookkeeping on top.
 
-    Empty or whitespace-only input returns an empty list.
+    IMPORTANT: line numbers are computed against `text` AFTER the leading
+    .strip() below, same as before — chunk_file() passes the raw file
+    content in, unmodified, so line 1 here means line 1 of the actual
+    file (assuming the file didn't have meaningful leading blank lines
+    stripped — see the empty-input guard, which only strips whitespace-only
+    input to nothing, not meaningful content).
+
+    Returns a list of dicts: {"text": str, "start_line": int, "end_line": int}
+    (1-indexed, inclusive). Empty or whitespace-only input returns [].
     """
+    original_text = text
     text = text.strip()
     if not text:
         return []
+
+    # If .strip() removed leading blank lines, line numbers computed against
+    # the stripped `text` would be too LOW relative to the real file (e.g.
+    # 3 leading blank lines stripped means "line 1" of the stripped text is
+    # actually line 4 of the real file). Count newlines in the stripped-away
+    # leading whitespace and add that as an offset to every reported line
+    # number below — found via direct testing with a leading-blank-lines
+    # file, not assumed; see INTEGRATION_PROGRESS.md for the test that
+    # caught this.
+    stripped_leading_text = original_text[:len(original_text) - len(original_text.lstrip())]
+    leading_line_offset   = stripped_leading_text.count("\n")
+
+    # Precompute the character offset of the start of every line in `text`,
+    # so we can binary-search (or linear-scan, at this size linear is fine)
+    # from a character position to a 1-indexed line number without
+    # recomputing line counts from scratch for every chunk.
+    line_start_offsets = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            line_start_offsets.append(i + 1)
+
+    def _char_offset_to_line(offset: int) -> int:
+        # Find the last line_start_offset <= offset -> that line (1-indexed
+        # within the STRIPPED text; leading_line_offset is added by the
+        # caller to convert to a real-file line number).
+        line = 1
+        for i, line_start in enumerate(line_start_offsets):
+            if line_start <= offset:
+                line = i + 1
+            else:
+                break
+        return line
 
     step   = CHUNK_SIZE_CHARS - OVERLAP_CHARS
     chunks = []
     start  = 0
 
     while start < len(text):
-        end   = start + CHUNK_SIZE_CHARS
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
+        end        = start + CHUNK_SIZE_CHARS
+        raw_slice  = text[start:end]
+        chunk_text = raw_slice.strip()
+        if chunk_text:
+            # Line numbers for the STRIPPED text's actual content span,
+            # not the raw window (so leading/trailing blank lines inside
+            # the window don't inflate the reported range).
+            stripped_leading  = len(raw_slice) - len(raw_slice.lstrip())
+            content_start_off = start + stripped_leading
+            content_end_off   = content_start_off + len(chunk_text) - 1
+            start_line = _char_offset_to_line(content_start_off) + leading_line_offset
+            end_line   = _char_offset_to_line(content_end_off) + leading_line_offset
+            chunks.append({
+                "text": chunk_text,
+                "start_line": start_line,
+                "end_line": end_line,
+            })
         start += step
 
     return chunks
@@ -298,7 +362,8 @@ def chunk_file(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     result = []
-    for idx, raw_chunk_text in enumerate(raw_chunks):
+    for idx, raw_chunk in enumerate(raw_chunks):
+        raw_chunk_text = raw_chunk["text"]
         # Prepend full header to chunk 0, short header to all subsequent chunks.
         if idx == 0:
             chunk_text = f"{full_header}\n\n{raw_chunk_text}"
@@ -341,6 +406,13 @@ def chunk_file(
 
             # Chunk position within this file (per-file, starts at 0).
             "chunk_index":  idx,
+
+            # NEW: real 1-indexed line range this chunk spans in the actual
+            # file (inclusive). Enables exact-line reference linking instead
+            # of the frontend's old Strategy A even-split guess — see
+            # _split_into_chunks' docstring for why this was added.
+            "start_line":   raw_chunk["start_line"],
+            "end_line":     raw_chunk["end_line"],
 
             # Timestamp of when this chunk was indexed.
             "indexed_at":   timestamp,

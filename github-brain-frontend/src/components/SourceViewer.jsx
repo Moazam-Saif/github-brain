@@ -5,13 +5,33 @@ const HL_ROW_CLASS = { a: 'hl-row-a', b: 'hl-row-b', c: 'hl-row-c' };
 const HL_BORDER_CLASS = { a: 'border-purple', b: 'border-muted-teal', c: 'border-bright-green' };
 
 /**
- * Strategy A line-range approximation (INTEGRATION_PLAN.md Section 6).
- * chunk_index is the chunk's position within the file, NOT a line number —
- * this estimates a line range assuming chunks are evenly distributed.
- * TODO: replace with chunk.start_line / chunk.end_line once chunker.py
- * is updated to store exact line ranges (plan Section 6, Strategy B).
+ * Strategy B (real line numbers) — NOW IMPLEMENTED. engine.py's
+ * ChunkItem.start_line/end_line come from chunker.py's real per-chunk
+ * line tracking (see INTEGRATION_PROGRESS.md "how the text is going to
+ * be connected to the source files" work), so this just uses them
+ * directly when present.
+ *
+ * Strategy A (estimateLineRangeFallback below) only fires for chunks
+ * from data indexed BEFORE that change — i.e. not yet re-indexed. Once
+ * every repo has been re-indexed, this fallback path is dead code and
+ * can be removed; kept for now so old sessions/cached data don't break.
  */
-function estimateLineRange(chunk, allChunks, totalLines) {
+function getLineRange(chunk, allChunks, totalLines) {
+  if (chunk.start_line != null && chunk.end_line != null) {
+    return { startLine: chunk.start_line, endLine: chunk.end_line };
+  }
+  return estimateLineRangeFallback(chunk, allChunks, totalLines);
+}
+
+/**
+ * Strategy A line-range APPROXIMATION — only used as a fallback for chunks
+ * that don't have real start_line/end_line yet (not re-indexed since the
+ * chunker.py line-tracking change). chunk_index is the chunk's position
+ * within the file, NOT a line number — this GUESSES a line range assuming
+ * chunks are evenly distributed, which is frequently wrong. See
+ * getLineRange above for the real, preferred path.
+ */
+function estimateLineRangeFallback(chunk, allChunks, totalLines) {
   const chunksForFile = allChunks.filter((c) => c.file_path === chunk.file_path);
   const totalChunks = Math.max(chunksForFile.length, 1);
   const linesPerChunk = Math.ceil(totalLines / totalChunks) || 1;
@@ -86,7 +106,7 @@ export default function SourceViewer({ files, chunks, selectedChunk, jumpTarget,
   const chunksInFile = (chunks || []).filter((c) => c.file_path === activeKey);
   const ranges = chunksInFile.map((c) => ({
     chunk: c,
-    ...estimateLineRange(c, chunks, activeFile.lines.length),
+    ...getLineRange(c, chunks, activeFile.lines.length),
   }));
 
   function rangeForLine(lineNum) {

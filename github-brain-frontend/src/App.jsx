@@ -220,8 +220,7 @@ export default function App() {
                 <ProseAnswer
                   body={sectionContent[activeSectionIndex]?.body}
                   chunks={displayChunks}
-                  files={result?.files}
-                  preferredFile={selectedChunk?.file_path}
+                  references={result?.references}
                   onJumpToChunk={handleJumpToSource}
                   onJumpToLine={handleJumpToLine}
                 />

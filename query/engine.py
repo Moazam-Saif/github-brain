@@ -360,7 +360,7 @@ Repository metadata:
 
 RESPONSE_STRUCTURE_INSTRUCTION = """
 
-Structure your ENTIRE response using exactly these four labeled parts, in
+Structure your ENTIRE response using exactly these five labeled parts, in
 this order, each starting on its own line with the marker shown:
 
 ---SUMMARY---
@@ -382,7 +382,17 @@ Write your full answer here, organized under markdown headings that exactly
 match the section headings listed above (## First section heading, etc).
 Do NOT repeat the summary here. When you reference a specific code chunk
 (numbered below), cite it inline like [N] right after the reference, e.g.
-"the Posts model [1] defines each blog entry".
+"the Posts model [1] defines each blog entry". Additionally, when you
+mention a SPECIFIC, REAL expression from the code you were given — a
+variable name, function/method call, config key, class name, etc., taken
+VERBATIM from a chunk's text below — mark it inline like {R1}, {R2}, ...
+immediately after the expression, e.g. "calls request.form.get{R1} to read
+the field". Each {RN} marker must have a matching entry in the
+---REFERENCES--- section below. Do NOT mark generic English words, file
+names mentioned only in passing, or anything you are paraphrasing rather
+than quoting — only real code tokens that appear verbatim in the chunk text
+you were given, because each one will become a link to that EXACT line in
+the source file, and a wrong or vague reference is worse than none.
 
 ---CHUNKS---
 For each numbered code chunk provided to you, write:
@@ -390,14 +400,27 @@ For each numbered code chunk provided to you, write:
 One to three sentences explaining what that chunk does and how it relates
 to the question.
 Include exactly one [N] block per chunk, in the same order and using the
-same chunk numbers given to you."""
+same chunk numbers given to you.
+
+---REFERENCES---
+For each {RN} marker you used in your answer, write one line in this exact
+format:
+[RN] expression | chunk N | line L
+- "expression" is the EXACT verbatim text you quoted (matching {RN})
+- "chunk N" is the chunk number (matching the [N] chunks given to you)
+- "line L" is the SINGLE line number where that expression literally
+  appears — read it directly from the "line_number: code" annotations in
+  the chunk text you were given; do not guess or estimate.
+If you used no {RN} markers, leave this section empty (just the marker
+line, nothing after it) — do not invent references to fill it."""
 
 
 def _build_semantic_prompt(question: str, chunks: list[dict]) -> str:
     """Prompt for cross_repo_semantic questions."""
     chunks_text = "\n\n---\n\n".join(
-        f"[{i + 1}] Repo: {c.get('repo_name')} | File: {c.get('file_path')}\n"
-        f"Similarity score: {c.get('score', 0):.2f}\n\n{c.get('text', '')}"
+        f"[{i + 1}] Repo: {c.get('repo_name')} | File: {c.get('file_path')} "
+        f"(lines {c.get('start_line', '?')}-{c.get('end_line', '?')})\n"
+        f"Similarity score: {c.get('score', 0):.2f}\n\n{_annotate_chunk_with_line_numbers(c)}"
         for i, c in enumerate(chunks)
     )
 
@@ -438,7 +461,8 @@ def _build_comparative_prompt(
             chunk_counter += 1
             chunk_lines.append(
                 f"  [{chunk_counter}] {c.get('file_path')} chunk {c.get('chunk_index')}"
-                f" (score {c.get('score', 0):.2f})\n  {c.get('text', '')}"
+                f" (lines {c.get('start_line', '?')}-{c.get('end_line', '?')}, "
+                f"score {c.get('score', 0):.2f})\n  {_annotate_chunk_with_line_numbers(c)}"
             )
         chunks_text = "\n\n".join(chunk_lines)
         techs    = ", ".join(repo.get("repo_technologies", [])) or "unknown"
@@ -484,6 +508,50 @@ Ranked repositories (by topic relevance):
 {RESPONSE_STRUCTURE_INSTRUCTION}"""
 
 
+def _annotate_chunk_with_line_numbers(chunk: dict) -> str:
+    """
+    Render a chunk's text with each CODE line prefixed by its real 1-indexed
+    line number in the source file, so Gemini can cite exact lines when it
+    references specific code (see RESPONSE_STRUCTURE_INSTRUCTION's
+    ---REFERENCES--- block, and INTEGRATION_PROGRESS.md's "how the text is
+    going to be connected to the source files" discussion).
+
+    chunker.py prepends a one-line ("File: ... | Role: ...") or two-line
+    ("File: ... | Role: ... | Purpose: ...") context header before the
+    actual code, followed by a blank line. That header is NOT part of the
+    file's real content — it has no meaningful line number — so it's kept
+    unannotated; numbering starts at chunk["start_line"] from the first
+    real code line onward.
+
+    Falls back to the chunk's raw text, unannotated, if start_line/end_line
+    aren't present (e.g. data indexed before this feature existed and not
+    yet re-indexed) — never crashes on missing fields.
+    """
+    text = chunk.get("text", "")
+    start_line = chunk.get("start_line")
+    end_line = chunk.get("end_line")
+
+    if start_line is None or end_line is None:
+        return text
+
+    # Split off the header: everything up to and including the first blank
+    # line (chunker.py always inserts "\n\n" between header and code).
+    if "\n\n" in text:
+        header, _, code = text.partition("\n\n")
+    else:
+        header, code = "", text
+
+    code_lines = code.split("\n")
+    numbered = []
+    line_num = start_line
+    for line in code_lines:
+        numbered.append(f"{line_num}: {line}")
+        line_num += 1
+
+    annotated_code = "\n".join(numbered)
+    return f"{header}\n\n{annotated_code}" if header else annotated_code
+
+
 def _build_repo_specific_prompt(
     question: str,
     chunks: list[dict],
@@ -520,9 +588,10 @@ def _build_repo_specific_prompt(
 
     # Show re-rank score if available, otherwise fall back to cosine score.
     chunks_text = "\n\n---\n\n".join(
-        f"[{i + 1}] File: {c.get('file_path')} (chunk {c.get('chunk_index')})\n"
+        f"[{i + 1}] File: {c.get('file_path')} (chunk {c.get('chunk_index')}, "
+        f"lines {c.get('start_line', '?')}-{c.get('end_line', '?')})\n"
         f"Relevance: {c.get('rerank_score', c.get('score', 0)):.2f}\n\n"
-        f"{c.get('text', '')}"
+        f"{_annotate_chunk_with_line_numbers(c)}"
         for i, c in enumerate(chunks)
     )
 
@@ -549,9 +618,46 @@ If something is unclear from the retrieved code, say so — don't guess.
 # Structured result building (for the API layer — see INTEGRATION_PLAN.md)
 # ---------------------------------------------------------------------------
 
-SECTION_MARKERS = ["---SUMMARY---", "---SECTIONS---", "---ANSWER---", "---CHUNKS---"]
+SECTION_MARKERS = ["---SUMMARY---", "---SECTIONS---", "---ANSWER---", "---CHUNKS---", "---REFERENCES---"]
 CHUNK_BLOCK_RE   = re.compile(r"^\[(\d+)\]\s*(.*)$")
 SECTION_LIST_RE  = re.compile(r"^\[S(\d+)\]\s*(.*)$")
+# "[RN] expression | chunk N | line L" — three pipe-separated fields after
+# the [RN] marker. Whitespace around pipes is tolerant since Gemini's exact
+# spacing isn't guaranteed.
+REFERENCE_RE     = re.compile(
+    r"^\[R(\d+)\]\s*(.+?)\s*\|\s*chunk\s*(\d+)\s*\|\s*line\s*(\d+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_references(block_text: str) -> dict:
+    """
+    Parse the ---REFERENCES--- block into
+    {int_r_number: {"expression": str, "chunk": int, "line": int}}.
+
+    Unlike _parse_numbered_blocks, this is a single-line-per-entry format
+    (no multi-line body), so it needs its own parser. Malformed lines
+    (wrong field count, non-numeric chunk/line) are silently skipped rather
+    than raising — a bad reference line just means that {RN} marker won't
+    resolve to a link in the frontend (renders as plain text), which is
+    the correct partial-degrade behavior: better to lose one clickable
+    reference than to crash the whole response over it.
+    """
+    references: dict[int, dict] = {}
+    for line in block_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = REFERENCE_RE.match(line)
+        if not m:
+            continue
+        r_num, expression, chunk_num, line_num = m.groups()
+        references[int(r_num)] = {
+            "expression": expression.strip(),
+            "chunk": int(chunk_num),
+            "line": int(line_num),
+        }
+    return references
 
 
 def _parse_numbered_blocks(block_text: str, key_re: "re.Pattern") -> dict:
@@ -589,7 +695,7 @@ def _parse_numbered_blocks(block_text: str, key_re: "re.Pattern") -> dict:
 def _parse_structured_response(raw: str) -> dict:
     """
     Parse a full (non-streaming) Gemini response in the RESPONSE_STRUCTURE_INSTRUCTION
-    format into its four parts.
+    format into its five parts.
 
     Returns:
       {
@@ -597,6 +703,7 @@ def _parse_structured_response(raw: str) -> dict:
         "sections": [{"heading": str}, ...],       # from ---SECTIONS---, in order
         "answer":   str,                           # from ---ANSWER---
         "chunk_blocks": {int: {"heading","text"}}, # from ---CHUNKS---
+        "references": {int: {"expression","chunk","line"}}, # from ---REFERENCES---
       }
 
     Fallback behavior (partial degrade, matches the streaming parser's
@@ -604,9 +711,11 @@ def _parse_structured_response(raw: str) -> dict:
     missing, those fields come back empty/[] and the frontend falls back to
     its existing heuristics (e.g. no jump-nav shown). If ---ANSWER--- is
     missing entirely (total malformation), the raw text is used as-is as the
-    answer, matching the old CHUNK_BLOCK_MARKER-missing fallback.
+    answer, matching the old CHUNK_BLOCK_MARKER-missing fallback. Missing or
+    empty ---REFERENCES--- just means no {RN} markers resolve to links —
+    the frontend treats those as plain text, never a crash.
     """
-    parts = {"summary": "", "sections": [], "answer": raw.strip(), "chunk_blocks": {}}
+    parts = {"summary": "", "sections": [], "answer": raw.strip(), "chunk_blocks": {}, "references": {}}
 
     if "---SUMMARY---" not in raw:
         return parts
@@ -635,6 +744,7 @@ def _parse_structured_response(raw: str) -> dict:
 
     parts["answer"] = buffers["---ANSWER---"].strip() or parts["answer"]
     parts["chunk_blocks"] = _parse_numbered_blocks(buffers["---CHUNKS---"], CHUNK_BLOCK_RE)
+    parts["references"] = _parse_references(buffers["---REFERENCES---"])
 
     return parts
 
@@ -746,6 +856,13 @@ def _build_result(
             "repo_name":   chunk.get("repo_name", ""),
             "score":       chunk.get("rerank_score", chunk.get("score", 0.0)),
             "col":         col_map.get(i, "c"),
+            # Real line range from chunker.py (see start_line/end_line
+            # addition, INTEGRATION_PROGRESS.md's "how the text is going to
+            # be connected to the source files" work) — None for chunks
+            # from data indexed before this field existed, in which case
+            # the frontend falls back to its old Strategy A estimate.
+            "start_line":  chunk.get("start_line"),
+            "end_line":    chunk.get("end_line"),
         })
 
     # Unique (repo, file_path) pairs to fetch, de-duplicated.
@@ -782,12 +899,47 @@ def _build_result(
 
     section_content = _split_answer_into_sections(parsed["answer"], parsed["sections"])
 
+    # Resolve each {RN} reference: translate its "chunk N" (1-indexed
+    # position in the prompt, matching chunk_items above) into the real
+    # file_path, and sanity-check the claimed line actually falls within
+    # that chunk's real start_line/end_line range — Gemini could hallucinate
+    # a line number even when told to read it from the annotated text, so
+    # this is a real validation, not just a lookup. A reference that fails
+    # this check is dropped entirely (not clamped/guessed) — a reference
+    # pointing at the wrong place is worse than no reference at all, same
+    # partial-degrade philosophy as everywhere else in this file.
+    references = {}
+    for r_num, ref in parsed["references"].items():
+        chunk_num = ref["chunk"]
+        if chunk_num < 1 or chunk_num > len(chunks):
+            continue
+        source_chunk = chunks[chunk_num - 1]
+        start_line = source_chunk.get("start_line")
+        end_line = source_chunk.get("end_line")
+        line = ref["line"]
+        if start_line is None or end_line is None:
+            # Chunk predates the start_line/end_line field (not yet
+            # re-indexed) — can't validate, so don't emit a reference that
+            # might point at the wrong line.
+            continue
+        if not (start_line <= line <= end_line):
+            print(f"  [engine] Dropping reference R{r_num}: line {line} is "
+                  f"outside chunk {chunk_num}'s real range "
+                  f"({start_line}-{end_line}) — likely hallucinated.")
+            continue
+        references[r_num] = {
+            "expression": ref["expression"],
+            "file_path": source_chunk.get("file_path", ""),
+            "line": line,
+        }
+
     return {
         "query_type":       query_type,
         "repo":             repo,
         "answer":           parsed["answer"],
         "summary":          parsed["summary"] or _fallback_summary(parsed["answer"]),
         "sections":         parsed["sections"],
+        "references":       references,
         "section_content":  section_content,
         "chunks":           chunk_items,
         "files":            files,
@@ -915,6 +1067,7 @@ def generate_answer_stream(prompt: str, client, max_retries: int = 3):
             if "answer" not in emitted:
                 yield {"event": "answer", "data": {"answer": full["answer"]}}
             yield {"event": "chunk_blocks", "data": {"chunk_blocks": full["chunk_blocks"]}}
+            yield {"event": "references", "data": {"references": full["references"]}}
             return
 
         except Exception as e:
@@ -1019,6 +1172,11 @@ def query(
                 full_answer += "---CHUNKS---\n" + "\n\n".join(
                     f"[{num}] {block['heading']}\n{block['text']}"
                     for num, block in event["data"]["chunk_blocks"].items()
+                ) + "\n\n"
+            elif event["event"] == "references":
+                full_answer += "---REFERENCES---\n" + "\n".join(
+                    f"[R{num}] {ref['expression']} | chunk {ref['chunk']} | line {ref['line']}"
+                    for num, ref in event["data"]["references"].items()
                 )
         return full_answer
 
